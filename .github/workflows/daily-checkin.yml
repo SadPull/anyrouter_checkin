@@ -1,0 +1,33 @@
+name: AnyRouter Daily Check-in
+
+on:
+  schedule:
+    # GitHub Actions cron uses UTC. 01:00 UTC is 09:00 Asia/Shanghai.
+    - cron: "0 1 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: anyrouter-daily-checkin
+  cancel-in-progress: false
+
+jobs:
+  check-in:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Run daily check-in
+        env:
+          ANYROUTER_USER_ID: ${{ secrets.ANYROUTER_USER_ID }}
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+        run: python anyrouter_checkin.py

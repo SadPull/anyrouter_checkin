@@ -1,0 +1,6 @@
+anyrouter.top.har
+*.har
+__pycache__/
+*.py[cod]
+.env
+.venv/
