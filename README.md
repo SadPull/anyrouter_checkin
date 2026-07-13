@@ -4,9 +4,10 @@
 
 ## 配置
 
-在 GitHub 仓库的 `Settings` → `Secrets and variables` → `Actions` 中添加两个 Repository secrets：
+在 GitHub 仓库的 `Settings` → `Secrets and variables` → `Actions` 中添加三个 Repository secrets：
 
 - `ANYROUTER_USER_ID`：浏览器登录 AnyRouter 后，HAR 请求头 `New-API-User` 的值。
+- `ANYROUTER_COOKIE`：浏览器已登录 AnyRouter 时，请求头中完整的 `Cookie` 值。当前 HAR 导出时没有包含 Cookie，必须从浏览器开发者工具的 Network 面板重新复制。
 - `PUSHPLUS_TOKEN`：PushPlus 网站获取的用户 token。
 
 不要把用户 ID、PushPlus token 或 HAR 文件提交到仓库。项目已通过 `.gitignore` 排除 HAR 和本地 `.env` 文件。
@@ -19,6 +20,7 @@
 
 ```powershell
 $env:ANYROUTER_USER_ID = "你的用户ID"
+$env:ANYROUTER_COOKIE = "浏览器请求头中的完整Cookie"
 $env:PUSHPLUS_TOKEN = "你的PushPlus令牌"
 python .\anyrouter_checkin.py
 ```

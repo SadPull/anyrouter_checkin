@@ -29,5 +29,6 @@ jobs:
       - name: Run daily check-in
         env:
           ANYROUTER_USER_ID: ${{ secrets.ANYROUTER_USER_ID }}
+          ANYROUTER_COOKIE: ${{ secrets.ANYROUTER_COOKIE }}
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
         run: python anyrouter_checkin.py

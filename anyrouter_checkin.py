@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import json
+import gzip
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -25,6 +27,13 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/150.0.0.0 Safari/537.36"
 )
+ACW_POSITIONS = [
+    15, 35, 29, 24, 33, 16, 1, 38, 10, 9, 19, 31, 40, 27, 22, 23, 25, 13,
+    6, 11, 39, 18, 20, 8, 14, 21, 32, 26, 2, 30, 7, 4, 17, 5, 3, 28, 34,
+    37, 12, 36,
+]
+ACW_XOR_KEY = "3000176000856006061501533003690027800375"
+_acw_cookie = ""
 
 
 class CheckinError(RuntimeError):
@@ -52,18 +61,41 @@ def request_json(
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         request_headers.setdefault("Content-Type", "application/json; charset=utf-8")
 
+    challenge_retried = False
     for attempt in range(1, attempts + 1):
         request = urllib.request.Request(
             url, data=body, headers=request_headers, method=method
         )
         try:
             with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
-                raw = response.read().decode("utf-8")
+                raw = response.read()
+                if response.headers.get("Content-Encoding", "").lower() == "gzip":
+                    try:
+                        raw = gzip.decompress(raw)
+                    except (OSError, EOFError) as exc:
+                        raise CheckinError(f"{method} {url} returned invalid gzip data") from exc
+                charset = response.headers.get_content_charset() or "utf-8"
                 try:
-                    result = json.loads(raw)
+                    text = raw.decode(charset)
+                except (LookupError, UnicodeDecodeError):
+                    text = raw.decode("utf-8", errors="replace")
+
+                challenge = re.search(r"var arg1='([0-9A-Fa-f]{40})'", text)
+                if challenge and not challenge_retried:
+                    global _acw_cookie
+                    _acw_cookie = solve_acw_cookie(challenge.group(1))
+                    request_headers["Cookie"] = merge_cookie(
+                        request_headers.get("Cookie", ""), "acw_sc__v2", _acw_cookie
+                    )
+                    challenge_retried = True
+                    continue
+                try:
+                    result = json.loads(text)
                 except json.JSONDecodeError as exc:
+                    content_type = response.headers.get("Content-Type", "unknown")
                     raise CheckinError(
-                        f"{method} {url} returned invalid JSON (HTTP {response.status})"
+                        f"{method} {url} returned non-JSON content "
+                        f"(HTTP {response.status}, Content-Type: {content_type})"
                     ) from exc
                 if not isinstance(result, dict):
                     raise CheckinError(f"{method} {url} returned a non-object JSON value")
@@ -82,18 +114,44 @@ def request_json(
     raise CheckinError(f"{method} {url} failed after {attempts} attempts")
 
 
-def anyrouter_headers(user_id: str) -> dict[str, str]:
-    return {
+def solve_acw_cookie(arg1: str) -> str:
+    rearranged = [""] * len(ACW_POSITIONS)
+    for index, char in enumerate(arg1):
+        rearranged[ACW_POSITIONS.index(index + 1)] = char
+    value = "".join(rearranged)
+    return "".join(
+        f"{int(value[i:i + 2], 16) ^ int(ACW_XOR_KEY[i:i + 2], 16):02x}"
+        for i in range(0, len(value), 2)
+    )
+
+
+def merge_cookie(cookie: str, name: str, value: str) -> str:
+    parts = [part.strip() for part in cookie.split(";") if part.strip()]
+    parts = [part for part in parts if part.split("=", 1)[0].strip() != name]
+    parts.append(f"{name}={value}")
+    return "; ".join(parts)
+
+
+def anyrouter_headers(user_id: str, login_cookie: str) -> dict[str, str]:
+    headers = {
         "New-API-User": user_id,
         "Accept": "application/json",
         "Cache-Control": "no-store",
         "User-Agent": USER_AGENT,
     }
+    if login_cookie:
+        headers["Cookie"] = login_cookie
+    if _acw_cookie:
+        headers["Cookie"] = merge_cookie(
+            headers.get("Cookie", ""), "acw_sc__v2", _acw_cookie
+        )
+    return headers
 
 
-def get_user(user_id: str) -> dict[str, Any]:
+def get_user(user_id: str, login_cookie: str) -> dict[str, Any]:
     result = request_json(
-        f"{ANYROUTER_BASE_URL}/api/user/self", headers=anyrouter_headers(user_id)
+        f"{ANYROUTER_BASE_URL}/api/user/self",
+        headers=anyrouter_headers(user_id, login_cookie),
     )
     if result.get("success") is not True or not isinstance(result.get("data"), dict):
         message = str(result.get("message") or "unknown server response")
@@ -101,11 +159,11 @@ def get_user(user_id: str) -> dict[str, Any]:
     return result["data"]
 
 
-def check_in(user_id: str) -> dict[str, Any]:
+def check_in(user_id: str, login_cookie: str) -> dict[str, Any]:
     result = request_json(
         f"{ANYROUTER_BASE_URL}/api/user/sign_in",
         method="POST",
-        headers=anyrouter_headers(user_id),
+        headers=anyrouter_headers(user_id, login_cookie),
     )
     if result.get("success") is not True:
         message = str(result.get("message") or "unknown server response")
@@ -137,9 +195,10 @@ def send_pushplus(token: str, title: str, content: str) -> None:
 
 def run() -> tuple[str, str]:
     user_id = required_env("ANYROUTER_USER_ID")
-    before = get_user(user_id)
-    checkin_result = check_in(user_id)
-    after = get_user(user_id)
+    login_cookie = required_env("ANYROUTER_COOKIE")
+    before = get_user(user_id, login_cookie)
+    checkin_result = check_in(user_id, login_cookie)
+    after = get_user(user_id, login_cookie)
 
     before_quota = int(before.get("quota", 0))
     after_quota = int(after.get("quota", 0))
@@ -174,7 +233,9 @@ def main() -> int:
         print("PushPlus notification sent successfully.")
         return 0
     except Exception as exc:
-        safe_error = exc if isinstance(exc, CheckinError) else CheckinError(type(exc).__name__)
+        safe_error = exc if isinstance(exc, CheckinError) else CheckinError(
+            f"Unexpected {type(exc).__name__}: {exc}"
+        )
         executed_at = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M:%S")
         title = "AnyRouter 每日签到失败"
         content = f"执行时间：{executed_at}（北京时间）\n失败原因：{safe_error}"
