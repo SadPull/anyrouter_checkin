@@ -28,7 +28,20 @@ jobs:
 
       - name: Run daily check-in
         env:
+          # 单账号（旧配置，继续兼容）
           ANYROUTER_USER_ID: ${{ secrets.ANYROUTER_USER_ID }}
           ANYROUTER_COOKIE: ${{ secrets.ANYROUTER_COOKIE }}
+          # 多账号：按需在仓库 Secrets 中添加对应编号；未配置的编号会被自动跳过。
+          # 如需超过 5 个账号，按同样格式继续追加。
+          ANYROUTER_USER_ID1: ${{ secrets.ANYROUTER_USER_ID1 }}
+          ANYROUTER_COOKIE1: ${{ secrets.ANYROUTER_COOKIE1 }}
+          ANYROUTER_USER_ID2: ${{ secrets.ANYROUTER_USER_ID2 }}
+          ANYROUTER_COOKIE2: ${{ secrets.ANYROUTER_COOKIE2 }}
+          ANYROUTER_USER_ID3: ${{ secrets.ANYROUTER_USER_ID3 }}
+          ANYROUTER_COOKIE3: ${{ secrets.ANYROUTER_COOKIE3 }}
+          ANYROUTER_USER_ID4: ${{ secrets.ANYROUTER_USER_ID4 }}
+          ANYROUTER_COOKIE4: ${{ secrets.ANYROUTER_COOKIE4 }}
+          ANYROUTER_USER_ID5: ${{ secrets.ANYROUTER_USER_ID5 }}
+          ANYROUTER_COOKIE5: ${{ secrets.ANYROUTER_COOKIE5 }}
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
         run: python anyrouter_checkin.py

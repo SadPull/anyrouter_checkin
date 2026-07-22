@@ -4,13 +4,23 @@
 
 ## 配置
 
-在 GitHub 仓库的 `Settings` → `Secrets and variables` → `Actions` 中添加三个 Repository secrets：
+在 GitHub 仓库的 `Settings` → `Secrets and variables` → `Actions` 中添加 Repository secrets：
 
 - `ANYROUTER_USER_ID`：浏览器登录 AnyRouter 后，HAR 请求头 `New-API-User` 的值。
 - `ANYROUTER_COOKIE`：浏览器已登录 AnyRouter 时，请求头中完整的 `Cookie` 值。当前 HAR 导出时没有包含 Cookie，必须从浏览器开发者工具的 Network 面板重新复制。
-- `PUSHPLUS_TOKEN`：PushPlus 网站获取的用户 token。
+- `PUSHPLUS_TOKEN`：PushPlus 网站获取的用户 token（所有账号共用一个）。
 
-不要把用户 ID、PushPlus token 或 HAR 文件提交到仓库。项目已通过 `.gitignore` 排除 HAR 和本地 `.env` 文件。
+### 多账号
+
+要同时给多个账号签到，按编号添加成对的 Secrets：
+
+- `ANYROUTER_USER_ID1` + `ANYROUTER_COOKIE1`
+- `ANYROUTER_USER_ID2` + `ANYROUTER_COOKIE2`
+- 依此类推……
+
+脚本会自动检测所有 `ANYROUTER_USER_ID<数字>`/`ANYROUTER_COOKIE<数字>` 成对变量，逐个签到并把所有结果合并到一条 PushPlus 通知里。不带编号的 `ANYROUTER_USER_ID`/`ANYROUTER_COOKIE` 也会作为一个账号一起签到（旧配置继续可用）。某个编号只配置了一半（只有 USER_ID 或只有 COOKIE）会报错。工作流文件默认透传编号 1–5，如需更多账号，在 `.github/workflows/daily-checkin.yml` 的 `env` 中按同样格式追加即可。
+
+不要把用户 ID、Cookie、PushPlus token 或 HAR 文件提交到仓库。项目已通过 `.gitignore` 排除 HAR 和本地 `.env` 文件。
 
 ## 使用
 

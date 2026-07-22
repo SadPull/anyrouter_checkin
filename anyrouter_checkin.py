@@ -40,13 +40,6 @@ class CheckinError(RuntimeError):
     """A user-facing error that is safe to print in CI logs."""
 
 
-def required_env(name: str) -> str:
-    value = os.environ.get(name, "").strip()
-    if not value:
-        raise CheckinError(f"Missing required environment variable: {name}")
-    return value
-
-
 def request_json(
     url: str,
     *,
@@ -193,9 +186,40 @@ def send_pushplus(token: str, title: str, content: str) -> None:
         raise CheckinError(f"PushPlus notification failed: {message}")
 
 
-def run() -> tuple[str, str]:
-    user_id = required_env("ANYROUTER_USER_ID")
-    login_cookie = required_env("ANYROUTER_COOKIE")
+def discover_accounts() -> list[tuple[str, str, str]]:
+    """Collect (label, user_id, cookie) triples from the environment.
+
+    Detects `ANYROUTER_USER_ID`/`ANYROUTER_COOKIE` (legacy single account)
+    plus every numbered pair `ANYROUTER_USER_ID<n>`/`ANYROUTER_COOKIE<n>`.
+    """
+    pattern = re.compile(r"^ANYROUTER_(USER_ID|COOKIE)(\d*)$")
+    suffixes: set[str] = set()
+    for name, value in os.environ.items():
+        match = pattern.match(name)
+        if match and value.strip():
+            suffixes.add(match.group(2))
+
+    accounts: list[tuple[str, str, str]] = []
+    for suffix in sorted(suffixes, key=lambda s: (s != "", int(s) if s else 0)):
+        user_id = os.environ.get(f"ANYROUTER_USER_ID{suffix}", "").strip()
+        cookie = os.environ.get(f"ANYROUTER_COOKIE{suffix}", "").strip()
+        label = f"账号{suffix}" if suffix else "账号"
+        if not user_id or not cookie:
+            missing = "USER_ID" if not user_id else "COOKIE"
+            raise CheckinError(
+                f"Incomplete account configuration: ANYROUTER_{missing}{suffix} is missing"
+            )
+        accounts.append((label, user_id, cookie))
+
+    if not accounts:
+        raise CheckinError(
+            "No account configured: set ANYROUTER_USER_ID/ANYROUTER_COOKIE "
+            "or numbered pairs like ANYROUTER_USER_ID1/ANYROUTER_COOKIE1"
+        )
+    return accounts
+
+
+def run_account(label: str, user_id: str, login_cookie: str) -> str:
     before = get_user(user_id, login_cookie)
     checkin_result = check_in(user_id, login_cookie)
     after = get_user(user_id, login_cookie)
@@ -205,20 +229,41 @@ def run() -> tuple[str, str]:
     delta = after_quota - before_quota
     username = str(after.get("display_name") or after.get("username") or "Unknown")
     message = str(checkin_result.get("message") or "签到接口返回成功")
-    executed_at = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M:%S")
 
-    title = "AnyRouter 每日签到成功"
-    content = "\n".join(
+    return "\n".join(
         [
-            f"执行时间：{executed_at}（北京时间）",
-            f"账号：{username}",
+            f"【{label}】{username}",
             f"签到结果：{message}",
             f"签到前额度：{quota_text(before_quota)}",
             f"当前额度：{quota_text(after_quota)}",
             f"额度变化：{quota_text(delta)}",
         ]
     )
-    return title, content
+
+
+def run() -> tuple[bool, str, str]:
+    accounts = discover_accounts()
+    executed_at = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M:%S")
+    sections = [f"执行时间：{executed_at}（北京时间）"]
+    failures = 0
+
+    for label, user_id, login_cookie in accounts:
+        try:
+            sections.append(run_account(label, user_id, login_cookie))
+        except Exception as exc:
+            failures += 1
+            safe_error = exc if isinstance(exc, CheckinError) else CheckinError(
+                f"Unexpected {type(exc).__name__}: {exc}"
+            )
+            print(f"ERROR [{label}]: {safe_error}", file=sys.stderr)
+            sections.append(f"【{label}】签到失败\n失败原因：{safe_error}")
+
+    total = len(accounts)
+    if failures == 0:
+        title = "AnyRouter 每日签到成功" if total == 1 else f"AnyRouter 每日签到成功（{total} 个账号）"
+    else:
+        title = f"AnyRouter 每日签到：{total - failures} 成功 / {failures} 失败"
+    return failures == 0, title, "\n\n".join(sections)
 
 
 def main() -> int:
@@ -226,12 +271,12 @@ def main() -> int:
     try:
         if not pushplus_token:
             raise CheckinError("Missing required environment variable: PUSHPLUS_TOKEN")
-        title, content = run()
+        all_ok, title, content = run()
         print(title)
         print(content)
         send_pushplus(pushplus_token, title, content)
         print("PushPlus notification sent successfully.")
-        return 0
+        return 0 if all_ok else 1
     except Exception as exc:
         safe_error = exc if isinstance(exc, CheckinError) else CheckinError(
             f"Unexpected {type(exc).__name__}: {exc}"
