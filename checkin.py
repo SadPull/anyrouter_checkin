@@ -36,6 +36,7 @@ PUSHPLUS_URL = "https://www.pushplus.plus/send"
 QUOTA_PER_USD = Decimal("500000")
 TIMEOUT_SECONDS = 15
 MAX_ATTEMPTS = 3
+RETRY_BACKOFF_SECONDS = 1
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -52,6 +53,10 @@ AUTH_FAILURE_HINTS = ("未登录", "无权", "登录已过期", "token 无效", 
 
 class CheckinError(RuntimeError):
     """A user-facing error that is safe to print in CI logs."""
+
+
+class WafBlockedError(CheckinError):
+    """The endpoint returned an HTML interstitial instead of its API JSON."""
 
 
 class CookieExpiredError(CheckinError):
@@ -80,12 +85,42 @@ def merge_cookie(cookie: str, name: str, value: str) -> str:
     return "; ".join(parts)
 
 
+def is_html(text: str, headers: Any = None) -> bool:
+    """True when a body is markup rather than JSON.
+
+    Checks the declared type first, then sniffs: WAF interstitials do not
+    always start with a doctype (they can open with <script> or a comment).
+    """
+    if headers is not None and "text/html" in headers.get("Content-Type", "").lower():
+        return True
+    head = text.lstrip()[:400].lower()
+    return head.startswith(("<!doctype", "<html", "<script", "<!--", "<meta", "<head"))
+
+
+def expects_json(request_headers: dict[str, str]) -> bool:
+    return "json" in request_headers.get("Accept", "").lower()
+
+
+def looks_login_page(text: str) -> bool:
+    """Identify an HTML login wall only when it contains clear login clues."""
+    lowered = text.lower()
+    markers = (
+        "<form action=\"/login",
+        "<form action='/login",
+        "/login",
+        "sign in",
+        "log in",
+        "unauthorized",
+        "未登录",
+    )
+    return any(marker in lowered for marker in markers)
+
+
 def looks_unauthenticated(text: str, message: str) -> bool:
     """True when a 200 response is really a login wall or an auth complaint."""
     if any(hint in message for hint in AUTH_FAILURE_HINTS):
         return True
-    stripped = text.lstrip()[:200].lower()
-    return stripped.startswith("<!doctype html") or stripped.startswith("<html")
+    return is_html(text)
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -172,6 +207,20 @@ class Session:
                         challenge_retried = True
                         attempt -= 1  # Solving the challenge is not a failed try.
                         continue
+
+                    # A WAF interstitial without an arg1 puzzle: the acw_tc
+                    # cookie just handed to us is often enough on a retry.
+                    # Datacenter IPs (GitHub runners) see this where a home IP
+                    # gets clean JSON, so retry rather than fail outright.
+                    if (
+                        not challenge
+                        and is_html(text, response.headers)
+                        and expects_json(request_headers)
+                    ):
+                        if attempt < attempts:
+                            time.sleep(RETRY_BACKOFF_SECONDS * attempt)
+                            continue
+
                     return response.status, response.headers, text
             except urllib.error.HTTPError as exc:
                 if not allow_redirects and 300 <= exc.code < 400:
@@ -179,6 +228,24 @@ class Session:
                     return exc.code, exc.headers, ""
                 if exc.code in (401, 403):
                     self._capture_set_cookie(exc.headers)
+                    error_text = decode_body(
+                        exc.read(), exc.headers, method, url
+                    )
+                    if is_html(error_text, exc.headers) and expects_json(
+                        request_headers
+                    ):
+                        if looks_login_page(error_text):
+                            raise self.expired(
+                                f"{method} {url} 返回了登录页（HTTP {exc.code}）"
+                            ) from exc
+                        if attempt < attempts:
+                            time.sleep(RETRY_BACKOFF_SECONDS * attempt)
+                            continue
+                        raise WafBlockedError(
+                            f"{method} {url} 返回了 HTML 而不是 JSON"
+                            f"（HTTP {exc.code}）：请求很可能被 WAF 拦截；"
+                            "可稍后重试或改用自建 runner"
+                        ) from exc
                     raise self.expired(f"{method} {url} 返回 HTTP {exc.code}") from exc
                 retryable = exc.code == 429 or 500 <= exc.code < 600
                 if not retryable or attempt >= attempts:
@@ -209,9 +276,20 @@ class Session:
         try:
             result = json.loads(text)
         except json.JSONDecodeError as exc:
-            if looks_unauthenticated(text, ""):
-                raise self.expired(f"{method} {url} 返回了登录页而不是 JSON") from exc
             content_type = response_headers.get("Content-Type", "unknown")
+            if is_html(text, response_headers):
+                if looks_login_page(text):
+                    raise self.expired(
+                        f"{method} {url} 返回了登录页而不是 JSON"
+                    ) from exc
+                # Distinguish a WAF interstitial from an actual login wall:
+                # blaming the cookie for a WAF block sends the user chasing
+                # the wrong fix.
+                raise WafBlockedError(
+                    f"{method} {url} 返回了 HTML 而不是 JSON（HTTP {status}）："
+                    "请求很可能被阿里云 WAF 拦截。GitHub Actions 的机房 IP 比家用 IP "
+                    "更容易触发，可稍后重试或改用自建 runner"
+                ) from exc
             raise CheckinError(
                 f"{method} {url} returned non-JSON content "
                 f"(HTTP {status}, Content-Type: {content_type})"
@@ -410,7 +488,7 @@ class AgentRouterProvider(Provider):
 
     def api_headers(self, user_id: str) -> dict[str, str]:
         headers = {
-            "Accept": "application/json",
+            "Accept": "application/json, text/plain, */*",
             "Cache-Control": "no-store",
             "User-Agent": USER_AGENT,
             "Referer": f"{AGENTROUTER_BASE_URL}/console",
@@ -677,8 +755,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-
-
-
 
