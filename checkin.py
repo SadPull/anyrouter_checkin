@@ -30,6 +30,7 @@ from zoneinfo import ZoneInfo
 
 ANYROUTER_BASE_URL = "https://anyrouter.top"
 AGENTROUTER_BASE_URL = "https://agentrouter.org"
+AGENTROUTER_FALLBACK_BASE_URL = "https://ps.air-outer.com"
 LINUXDO_AUTHORIZE_URL = "https://connect.linux.do/oauth2/authorize"
 PUSHPLUS_URL = "https://www.pushplus.plus/send"
 # Both sites report quota_per_unit = 500000 in /api/status.
@@ -486,31 +487,49 @@ class AgentRouterProvider(Provider):
                 )
         return accounts
 
-    def api_headers(self, user_id: str) -> dict[str, str]:
+    def api_headers(
+        self, user_id: str, base_url: str = AGENTROUTER_BASE_URL
+    ) -> dict[str, str]:
         headers = {
             "Accept": "application/json, text/plain, */*",
             "Cache-Control": "no-store",
             "User-Agent": USER_AGENT,
-            "Referer": f"{AGENTROUTER_BASE_URL}/console",
+            "Referer": f"{base_url}/console",
         }
         if user_id:
             headers["New-API-User"] = user_id
         return headers
 
+    def request_json(
+        self,
+        session: Session,
+        path: str,
+        *,
+        user_id: str = "",
+    ) -> dict[str, Any]:
+        """Use the official backup domain when the primary is WAF-blocked."""
+        blocked: WafBlockedError | None = None
+        for base_url in (AGENTROUTER_BASE_URL, AGENTROUTER_FALLBACK_BASE_URL):
+            try:
+                return session.request_json(
+                    f"{base_url}{path}",
+                    headers=self.api_headers(user_id, base_url),
+                )
+            except WafBlockedError as exc:
+                blocked = exc
+                continue
+        assert blocked is not None
+        raise blocked
+
     def get_user(self, session: Session, user_id: str) -> dict[str, Any]:
-        result = session.request_json(
-            f"{AGENTROUTER_BASE_URL}/api/user/self",
-            headers=self.api_headers(user_id),
-        )
+        result = self.request_json(session, "/api/user/self", user_id=user_id)
         if result.get("success") is not True or not isinstance(result.get("data"), dict):
             message = str(result.get("message") or "unknown server response")
             raise CheckinError(f"读取 AgentRouter 用户信息失败：{message}")
         return result["data"]
 
     def linuxdo_client_id(self, session: Session) -> str:
-        result = session.request_json(
-            f"{AGENTROUTER_BASE_URL}/api/status", headers=self.api_headers("")
-        )
+        result = self.request_json(session, "/api/status")
         data = result.get("data")
         client_id = ""
         if isinstance(data, dict):
@@ -520,10 +539,7 @@ class AgentRouterProvider(Provider):
         return client_id
 
     def oauth_state(self, session: Session) -> str:
-        result = session.request_json(
-            f"{AGENTROUTER_BASE_URL}/api/oauth/state?mode=login",
-            headers=self.api_headers(""),
-        )
+        result = self.request_json(session, "/api/oauth/state?mode=login")
         state = str(result.get("data") or "")
         if result.get("success") is not True or not state:
             message = str(result.get("message") or "unknown server response")
@@ -583,10 +599,7 @@ class AgentRouterProvider(Provider):
         state = self.oauth_state(session)
         code = self.authorize_code(linuxdo_cookie, client_id, state)
         query = urllib.parse.urlencode({"code": code, "state": state, "mode": "login"})
-        result = session.request_json(
-            f"{AGENTROUTER_BASE_URL}/api/oauth/linuxdo?{query}",
-            headers=self.api_headers(""),
-        )
+        result = self.request_json(session, f"/api/oauth/linuxdo?{query}")
         if result.get("success") is not True:
             message = str(result.get("message") or "unknown server response")
             raise RelayError(f"OAuth 回调失败：{message}")
@@ -755,4 +768,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

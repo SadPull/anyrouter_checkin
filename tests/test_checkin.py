@@ -251,6 +251,46 @@ class AgentRouterTests(unittest.TestCase):
         self.assertEqual(headers["New-API-User"], "277969")
         self.assertNotIn("New-API-User", self.provider.api_headers(""))
 
+    def test_waf_block_uses_official_backup_domain(self):
+        session = checkin.Session()
+        with patch.object(
+            session,
+            "request_json",
+            side_effect=[
+                checkin.WafBlockedError("primary blocked"),
+                {"success": True, "data": {"id": 1}},
+            ],
+        ) as request_json:
+            result = self.provider.request_json(
+                session, "/api/user/self", user_id="277969"
+            )
+
+        self.assertTrue(result["success"])
+        primary = request_json.call_args_list[0]
+        fallback = request_json.call_args_list[1]
+        self.assertEqual(
+            primary.args[0], "https://agentrouter.org/api/user/self"
+        )
+        self.assertEqual(
+            fallback.args[0], "https://ps.air-outer.com/api/user/self"
+        )
+        self.assertEqual(
+            fallback.kwargs["headers"]["Referer"],
+            "https://ps.air-outer.com/console",
+        )
+
+    def test_non_waf_error_does_not_switch_domain(self):
+        session = checkin.Session()
+        with patch.object(
+            session,
+            "request_json",
+            side_effect=checkin.CookieExpiredError("expired"),
+        ) as request_json:
+            with self.assertRaises(checkin.CookieExpiredError):
+                self.provider.request_json(session, "/api/user/self")
+
+        request_json.assert_called_once()
+
     def test_oauth_checked_in_true_reports_success(self):
         with patch.object(
             self.provider, "relay_login", return_value={"checked_in": True}
