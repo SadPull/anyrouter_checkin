@@ -74,6 +74,8 @@ jobs:
           sed -i 's/from g4f.Provider.qwen.fingerprint import generate_fingerprint/from fingerprint import generate_fingerprint/' cookie_generator.py
           python - <<'PY'
           import json
+          import re
+          import uuid
           import urllib.request
           from cookie_generator import generate_cookies
 
@@ -84,6 +86,17 @@ jobs:
               f"ssxmod_itna={generated['ssxmod_itna']}; "
               f"ssxmod_itna2={generated['ssxmod_itna2']}"
           )
+          wu_request = urllib.request.Request(
+              "https://sg-wum.alibaba.com/w/wu.json",
+              headers={"User-Agent": "Mozilla/5.0"},
+          )
+          wu_body = urllib.request.urlopen(wu_request, timeout=20).read().decode(
+              "utf-8", errors="replace"
+          )
+          token_match = re.search(r"(?:umx\.wu|__fycb)\('([^']+)'\)", wu_body)
+          if not token_match:
+              raise RuntimeError("Could not extract bx-umidtoken")
+          umid_token = token_match.group(1)
           for base in ("https://agentrouter.org", "https://ps.air-outer.com"):
               request = urllib.request.Request(
                   base + "/api/status",
@@ -91,6 +104,7 @@ jobs:
                       "Accept": "application/json, text/plain, */*",
                       "Accept-Language": "zh-CN,zh;q=0.9",
                       "Cookie": cookie,
+                      "Origin": base,
                       "Referer": base + "/console",
                       "Sec-Fetch-Dest": "empty",
                       "Sec-Fetch-Mode": "cors",
@@ -100,6 +114,11 @@ jobs:
                           "(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
                       ),
                       "X-Requested-With": "XMLHttpRequest",
+                      "bx-umidtoken": umid_token,
+                      "bx-v": "2.5.36",
+                      "source": "web",
+                      "version": "0.2.63",
+                      "x-request-id": str(uuid.uuid4()),
                   },
               )
               response = urllib.request.urlopen(request, timeout=20)
