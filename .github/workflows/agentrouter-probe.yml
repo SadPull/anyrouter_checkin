@@ -14,6 +14,19 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
+      - name: Set up Cloudflare WARP
+        if: runner.os == 'Linux'
+        uses: fscarmen/warp-on-actions@37ce1997e075435a827991dabcce1d080c1fe512
+        with:
+          stack: ipv4
+          mode: wireguard
+
+      - name: Show WARP status
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          curl --silent --show-error https://www.cloudflare.com/cdn-cgi/trace | grep -E '^(ip|loc|warp)='
+
       - name: Probe public endpoints with Python
         shell: python
         run: |
