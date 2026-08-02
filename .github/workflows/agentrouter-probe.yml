@@ -132,3 +132,51 @@ jobs:
                   "prefix=", repr(body[:120]),
               )
           PY
+
+      - name: Probe with a real Chrome session
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          python -m pip install --quiet selenium
+          xvfb-run -a python - <<'PY'
+          import json
+          import time
+          from selenium import webdriver
+          from selenium.webdriver.chrome.options import Options
+
+          options = Options()
+          options.add_argument("--no-sandbox")
+          options.add_argument("--disable-dev-shm-usage")
+          options.add_argument("--disable-blink-features=AutomationControlled")
+          options.add_argument("--window-size=1920,1080")
+          options.add_experimental_option("excludeSwitches", ["enable-automation"])
+          driver = webdriver.Chrome(options=options)
+          try:
+              driver.execute_cdp_cmd(
+                  "Page.addScriptToEvaluateOnNewDocument",
+                  {
+                      "source": (
+                          "Object.defineProperty(navigator, 'webdriver', "
+                          "{get: () => undefined})"
+                      )
+                  },
+              )
+              for base in ("https://agentrouter.org", "https://ps.air-outer.com"):
+                  driver.get(base + "/api/status")
+                  for _ in range(15):
+                      body = driver.find_element("tag name", "body").text
+                      if body.lstrip().startswith("{"):
+                          break
+                      time.sleep(1)
+                  cookies = [cookie["name"] for cookie in driver.get_cookies()]
+                  print(
+                      base,
+                      "url=", driver.current_url,
+                      "json=", body.lstrip().startswith("{"),
+                      "length=", len(body),
+                      "cookies=", sorted(cookies),
+                      "prefix=", repr(body[:120]),
+                  )
+          finally:
+              driver.quit()
+          PY
