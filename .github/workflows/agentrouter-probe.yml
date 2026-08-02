@@ -14,6 +14,9 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
       - name: Set up Cloudflare WARP
         if: runner.os == 'Linux'
         uses: fscarmen/warp-on-actions@37ce1997e075435a827991dabcce1d080c1fe512
@@ -232,3 +235,127 @@ jobs:
                   "json=", body.lstrip().startswith("{"),
                   "prefix=", repr(body[:120]),
               )
+
+      - name: Probe LinuxDO OAuth with real Chrome
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          AGENTROUTER_LINUXDO_COOKIE: ${{ secrets.AGENTROUTER_LINUXDO_COOKIE }}
+          AGENTROUTER_USER_ID: ${{ secrets.AGENTROUTER_USER_ID }}
+        run: |
+          xvfb-run -a python - <<'PY'
+          import json
+          import os
+          import time
+          import urllib.parse
+
+          from selenium import webdriver
+          from selenium.webdriver.chrome.options import Options
+          from selenium.webdriver.common.by import By
+
+          import checkin
+
+          token_cookie = checkin.select_cookie(
+              os.environ.get("AGENTROUTER_LINUXDO_COOKIE", ""),
+              {"auth.session-token"},
+          )
+          if not token_cookie:
+              raise RuntimeError("AGENTROUTER_LINUXDO_COOKIE lacks auth.session-token")
+          token = token_cookie.split("=", 1)[1]
+
+          provider = checkin.AgentRouterProvider()
+          session = checkin.Session(cookie_env="AGENTROUTER_LINUXDO_COOKIE")
+          client_id = provider.linuxdo_client_id(session)
+          state = provider.oauth_state(session)
+          authorize_url = checkin.LINUXDO_AUTHORIZE_URL + "?" + urllib.parse.urlencode(
+              {"response_type": "code", "client_id": client_id, "state": state}
+          )
+
+          options = Options()
+          options.add_argument("--no-sandbox")
+          options.add_argument("--disable-dev-shm-usage")
+          options.add_argument("--disable-blink-features=AutomationControlled")
+          options.add_argument("--window-size=1920,1080")
+          options.add_experimental_option("excludeSwitches", ["enable-automation"])
+          options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
+          driver = webdriver.Chrome(options=options)
+          code = ""
+          try:
+              driver.execute_cdp_cmd(
+                  "Page.addScriptToEvaluateOnNewDocument",
+                  {
+                      "source": (
+                          "Object.defineProperty(navigator, 'webdriver', "
+                          "{get: () => undefined})"
+                      )
+                  },
+              )
+              driver.get("https://connect.linux.do/")
+              driver.add_cookie(
+                  {
+                      "name": "auth.session-token",
+                      "value": token,
+                      "domain": "connect.linux.do",
+                      "path": "/",
+                      "secure": True,
+                      "httpOnly": True,
+                  }
+              )
+              driver.get(authorize_url)
+              deadline = time.time() + 45
+              consent_clicked = False
+              while time.time() < deadline and not code:
+                  current = urllib.parse.urlparse(driver.current_url)
+                  query = urllib.parse.parse_qs(current.query)
+                  if current.path == "/oauth/linuxdo" and query.get("code"):
+                      code = query["code"][0]
+                      break
+                  for entry in driver.get_log("performance"):
+                      event = json.loads(entry["message"])["message"]
+                      if event.get("method") != "Network.requestWillBeSent":
+                          continue
+                      url = event.get("params", {}).get("request", {}).get("url", "")
+                      parsed = urllib.parse.urlparse(url)
+                      params = urllib.parse.parse_qs(parsed.query)
+                      if parsed.path == "/oauth/linuxdo" and params.get("code"):
+                          code = params["code"][0]
+                          break
+                  if not code and not consent_clicked:
+                      for button in driver.find_elements(By.TAG_NAME, "button"):
+                          label = button.text.strip().lower()
+                          if any(word in label for word in ("授权", "允许", "authorize", "allow")):
+                              button.click()
+                              consent_clicked = True
+                              break
+                  time.sleep(1)
+
+              parsed = urllib.parse.urlparse(driver.current_url)
+              print(
+                  "oauth_browser_result",
+                  "code_received=", bool(code),
+                  "host=", parsed.netloc,
+                  "path=", parsed.path,
+                  "title=", repr(driver.title[:80]),
+              )
+          finally:
+              driver.quit()
+
+          if not code:
+              raise RuntimeError("Chrome did not receive a LinuxDO authorization code")
+          callback = "/api/oauth/linuxdo?" + urllib.parse.urlencode(
+              {"code": code, "state": state, "mode": "login"}
+          )
+          result = provider.request_json(session, callback)
+          data = result.get("data") if isinstance(result.get("data"), dict) else {}
+          print(
+              "oauth_callback",
+              "success=", result.get("success"),
+              "checked_in=", bool(data.get("checked_in")),
+          )
+          user = provider.get_user(session, os.environ.get("AGENTROUTER_USER_ID", ""))
+          print(
+              "oauth_user",
+              "id=", user.get("id"),
+              "quota=", user.get("quota"),
+          )
+          PY
