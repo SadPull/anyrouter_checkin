@@ -247,7 +247,9 @@ jobs:
           import json
           import os
           import time
+          import urllib.error
           import urllib.parse
+          import urllib.request
 
           from selenium import webdriver
           from selenium.webdriver.chrome.options import Options
@@ -376,7 +378,52 @@ jobs:
                                   "continue",
                               )
                           ):
-                              driver.execute_script("arguments[0].click();", element)
+                              href = element.get_attribute("href") or ""
+                              if href:
+                                  browser_cookie = "; ".join(
+                                      f"{cookie['name']}={cookie['value']}"
+                                      for cookie in driver.get_cookies()
+                                  )
+                                  opener = urllib.request.build_opener(
+                                      checkin._NoRedirect()
+                                  )
+                                  request = urllib.request.Request(
+                                      href,
+                                      headers={
+                                          "Accept": (
+                                              "text/html,application/xhtml+xml,"
+                                              "application/xml;q=0.9,*/*;q=0.8"
+                                          ),
+                                          "Accept-Language": "zh-CN,zh;q=0.9",
+                                          "Cookie": browser_cookie,
+                                          "Referer": driver.current_url,
+                                          "User-Agent": driver.execute_script(
+                                              "return navigator.userAgent"
+                                          ),
+                                      },
+                                  )
+                                  try:
+                                      response = opener.open(request, timeout=20)
+                                      status = response.status
+                                      location = response.headers.get("Location") or ""
+                                  except urllib.error.HTTPError as error:
+                                      status = error.code
+                                      location = error.headers.get("Location") or ""
+                                  redirect = urllib.parse.urlparse(location)
+                                  redirect_query = urllib.parse.parse_qs(
+                                      redirect.query
+                                  )
+                                  if redirect_query.get("code"):
+                                      code = redirect_query["code"][0]
+                                  print(
+                                      "oauth_direct_approve",
+                                      "status=", status,
+                                      "code_received=", bool(code),
+                                  )
+                              if not code:
+                                  driver.execute_script(
+                                      "arguments[0].click();", element
+                                  )
                               consent_clicked = True
                               print("oauth_consent_clicked", repr(label[:80]))
                               break
