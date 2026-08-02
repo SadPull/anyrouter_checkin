@@ -1,0 +1,61 @@
+name: AgentRouter Probe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Probe public endpoints with Python
+        shell: python
+        run: |
+          import urllib.error
+          import urllib.request
+
+          headers = {
+              "Accept": "application/json, text/plain, */*",
+              "Referer": "https://agentrouter.org/console",
+              "User-Agent": (
+                  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/150.0.0.0 Safari/537.36"
+              ),
+          }
+          for base in ("https://agentrouter.org", "https://ps.air-outer.com"):
+              request = urllib.request.Request(base + "/api/status", headers=headers)
+              try:
+                  response = urllib.request.urlopen(request, timeout=20)
+              except urllib.error.HTTPError as error:
+                  response = error
+              body = response.read().decode("utf-8", errors="replace")
+              print(
+                  base,
+                  "status=", response.status,
+                  "content_type=", response.headers.get("Content-Type"),
+                  "length=", len(body),
+                  "arg1=", "var arg1=" in body,
+                  "prefix=", repr(body[:120]),
+              )
+
+      - name: Probe public endpoints with curl
+        shell: bash
+        run: |
+          for base in https://agentrouter.org https://ps.air-outer.com; do
+            echo "$base"
+            curl --silent --show-error --compressed \
+              --user-agent 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36' \
+              --header 'Accept: application/json, text/plain, */*' \
+              --referer "$base/console" \
+              --dump-header - \
+              --output response.txt \
+              "$base/api/status"
+            python -c "from pathlib import Path; body=Path('response.txt').read_text(encoding='utf-8', errors='replace'); print('length=', len(body), 'arg1=', 'var arg1=' in body, 'prefix=', repr(body[:120]))"
+          done
