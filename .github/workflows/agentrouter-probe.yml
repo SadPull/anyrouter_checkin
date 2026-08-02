@@ -59,3 +59,57 @@ jobs:
               "$base/api/status"
             python -c "from pathlib import Path; body=Path('response.txt').read_text(encoding='utf-8', errors='replace'); print('length=', len(body), 'arg1=', 'var arg1=' in body, 'prefix=', repr(body[:120]))"
           done
+
+      - name: Probe SSXMOD fingerprint cookies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          curl --silent --show-error --location \
+            https://raw.githubusercontent.com/xtekky/gpt4free/main/g4f/Provider/qwen/fingerprint.py \
+            --output fingerprint.py
+          curl --silent --show-error --location \
+            https://raw.githubusercontent.com/xtekky/gpt4free/main/g4f/Provider/qwen/cookie_generator.py \
+            --output cookie_generator.py
+          sed -i '/from g4f import debug/d' cookie_generator.py
+          sed -i 's/from g4f.Provider.qwen.fingerprint import generate_fingerprint/from fingerprint import generate_fingerprint/' cookie_generator.py
+          python - <<'PY'
+          import json
+          import urllib.request
+          from cookie_generator import generate_cookies
+
+          generated = generate_cookies(
+              fingerprint_options={"platform": "linux", "locale": "zh-CN"}
+          )
+          cookie = (
+              f"ssxmod_itna={generated['ssxmod_itna']}; "
+              f"ssxmod_itna2={generated['ssxmod_itna2']}"
+          )
+          for base in ("https://agentrouter.org", "https://ps.air-outer.com"):
+              request = urllib.request.Request(
+                  base + "/api/status",
+                  headers={
+                      "Accept": "application/json, text/plain, */*",
+                      "Accept-Language": "zh-CN,zh;q=0.9",
+                      "Cookie": cookie,
+                      "Referer": base + "/console",
+                      "Sec-Fetch-Dest": "empty",
+                      "Sec-Fetch-Mode": "cors",
+                      "Sec-Fetch-Site": "same-origin",
+                      "User-Agent": (
+                          "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
+                      ),
+                      "X-Requested-With": "XMLHttpRequest",
+                  },
+              )
+              response = urllib.request.urlopen(request, timeout=20)
+              body = response.read().decode("utf-8", errors="replace")
+              print(
+                  base,
+                  "status=", response.status,
+                  "content_type=", response.headers.get("Content-Type"),
+                  "length=", len(body),
+                  "json=", body.lstrip().startswith("{"),
+                  "prefix=", repr(body[:120]),
+              )
+          PY
