@@ -228,6 +228,19 @@ class SessionTests(unittest.TestCase):
             )
 
 
+class CookieHelperTests(unittest.TestCase):
+    def test_select_cookie_removes_ip_bound_clearance(self):
+        cookie = (
+            "auth.session-token=stable; cf_clearance=bound; "
+            "_cfuvid=bound-too; analytics=value"
+        )
+
+        self.assertEqual(
+            checkin.select_cookie(cookie, {"auth.session-token"}),
+            "auth.session-token=stable",
+        )
+
+
 class AgentRouterTests(unittest.TestCase):
     def setUp(self):
         self.provider = checkin.AgentRouterProvider()

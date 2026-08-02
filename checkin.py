@@ -86,6 +86,19 @@ def merge_cookie(cookie: str, name: str, value: str) -> str:
     return "; ".join(parts)
 
 
+def select_cookie(cookie: str, allowed_names: set[str]) -> str:
+    """Keep only stable cookies needed by a cross-network auth request."""
+    selected: list[str] = []
+    for part in cookie.split(";"):
+        part = part.strip()
+        if "=" not in part:
+            continue
+        name = part.split("=", 1)[0].strip()
+        if name in allowed_names:
+            selected.append(part)
+    return "; ".join(selected)
+
+
 def is_html(text: str, headers: Any = None) -> bool:
     """True when a body is markup rather than JSON.
 
@@ -557,7 +570,14 @@ class AgentRouterProvider(Provider):
             {"response_type": "code", "client_id": client_id, "state": state}
         )
         # A dedicated session: the forum cookie must never leak to AgentRouter.
-        forum = Session(base_cookie=linuxdo_cookie, cookie_env="LINUXDO_COOKIE")
+        # Cloudflare clearance cookies are bound to the browser's IP and
+        # fingerprint. GitHub Actions uses a different egress (WARP), so
+        # replaying cf_clearance/_cfuvid there causes an immediate 403. The
+        # LinuxDO login itself is represented by auth.session-token.
+        stable_cookie = select_cookie(linuxdo_cookie, {"auth.session-token"})
+        if not stable_cookie:
+            raise RelayError("LinuxDO Cookie 中缺少 auth.session-token")
+        forum = Session(base_cookie=stable_cookie, cookie_env="LINUXDO_COOKIE")
         try:
             status, headers, _ = forum.request_raw(
                 f"{LINUXDO_AUTHORIZE_URL}?{query}",
