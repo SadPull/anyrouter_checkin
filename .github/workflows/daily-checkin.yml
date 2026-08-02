@@ -1,4 +1,4 @@
-name: AnyRouter Daily Check-in
+name: Daily Check-in
 
 on:
   schedule:
@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: anyrouter-daily-checkin
+  group: daily-checkin
   cancel-in-progress: false
 
 jobs:
@@ -28,10 +28,10 @@ jobs:
 
       - name: Run daily check-in
         env:
-          # 单账号（旧配置，继续兼容）
+          # AnyRouter 单账号（旧配置，继续兼容）
           ANYROUTER_USER_ID: ${{ secrets.ANYROUTER_USER_ID }}
           ANYROUTER_COOKIE: ${{ secrets.ANYROUTER_COOKIE }}
-          # 多账号：按需在仓库 Secrets 中添加对应编号；未配置的编号会被自动跳过。
+          # AnyRouter 多账号：按需在仓库 Secrets 中添加对应编号；未配置的编号会被自动跳过。
           # 如需超过 5 个账号，按同样格式继续追加。
           ANYROUTER_USER_ID1: ${{ secrets.ANYROUTER_USER_ID1 }}
           ANYROUTER_COOKIE1: ${{ secrets.ANYROUTER_COOKIE1 }}
@@ -43,5 +43,26 @@ jobs:
           ANYROUTER_COOKIE4: ${{ secrets.ANYROUTER_COOKIE4 }}
           ANYROUTER_USER_ID5: ${{ secrets.ANYROUTER_USER_ID5 }}
           ANYROUTER_COOKIE5: ${{ secrets.ANYROUTER_COOKIE5 }}
+          # AgentRouter 账号：LINUXDO_COOKIE 用于 OAuth 签到中继，COOKIE 是降级路径。
+          # 至少要配一个 cookie；两个都配则优先中继，失败自动降级。
+          AGENTROUTER_USER_ID: ${{ secrets.AGENTROUTER_USER_ID }}
+          AGENTROUTER_LINUXDO_COOKIE: ${{ secrets.AGENTROUTER_LINUXDO_COOKIE }}
+          AGENTROUTER_COOKIE: ${{ secrets.AGENTROUTER_COOKIE }}
+          AGENTROUTER_USER_ID1: ${{ secrets.AGENTROUTER_USER_ID1 }}
+          AGENTROUTER_LINUXDO_COOKIE1: ${{ secrets.AGENTROUTER_LINUXDO_COOKIE1 }}
+          AGENTROUTER_COOKIE1: ${{ secrets.AGENTROUTER_COOKIE1 }}
+          AGENTROUTER_USER_ID2: ${{ secrets.AGENTROUTER_USER_ID2 }}
+          AGENTROUTER_LINUXDO_COOKIE2: ${{ secrets.AGENTROUTER_LINUXDO_COOKIE2 }}
+          AGENTROUTER_COOKIE2: ${{ secrets.AGENTROUTER_COOKIE2 }}
+          AGENTROUTER_USER_ID3: ${{ secrets.AGENTROUTER_USER_ID3 }}
+          AGENTROUTER_LINUXDO_COOKIE3: ${{ secrets.AGENTROUTER_LINUXDO_COOKIE3 }}
+          AGENTROUTER_COOKIE3: ${{ secrets.AGENTROUTER_COOKIE3 }}
+          AGENTROUTER_USER_ID4: ${{ secrets.AGENTROUTER_USER_ID4 }}
+          AGENTROUTER_LINUXDO_COOKIE4: ${{ secrets.AGENTROUTER_LINUXDO_COOKIE4 }}
+          AGENTROUTER_COOKIE4: ${{ secrets.AGENTROUTER_COOKIE4 }}
+          AGENTROUTER_USER_ID5: ${{ secrets.AGENTROUTER_USER_ID5 }}
+          AGENTROUTER_LINUXDO_COOKIE5: ${{ secrets.AGENTROUTER_LINUXDO_COOKIE5 }}
+          AGENTROUTER_COOKIE5: ${{ secrets.AGENTROUTER_COOKIE5 }}
+          # PushPlus 推送（所有站点共用一个 token）
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
-        run: python anyrouter_checkin.py
+        run: python checkin.py
