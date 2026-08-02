@@ -180,3 +180,42 @@ jobs:
           finally:
               driver.quit()
           PY
+
+      - name: Probe Claude Code client fingerprint
+        if: runner.os == 'Linux'
+        shell: python
+        run: |
+          import urllib.request
+
+          headers = {
+              "Accept": "application/json",
+              "User-Agent": "claude-cli/2.1.119 (external, cli)",
+              "x-app": "cli",
+              "X-Stainless-Lang": "js",
+              "X-Stainless-Runtime": "node",
+              "X-Stainless-Runtime-Version": "v20.10.0",
+              "X-Stainless-OS": "Linux",
+              "X-Stainless-Arch": "x64",
+              "X-Stainless-Package-Version": "0.39.0",
+              "anthropic-version": "2023-06-01",
+              "anthropic-beta": (
+                  "interleaved-thinking-2025-05-14,"
+                  "redact-thinking-2026-02-12,"
+                  "context-management-2025-06-27,"
+                  "prompt-caching-scope-2026-01-05,"
+                  "claude-code-20250219"
+              ),
+              "anthropic-dangerous-direct-browser-access": "true",
+          }
+          for base in ("https://agentrouter.org", "https://ps.air-outer.com"):
+              request = urllib.request.Request(base + "/api/status", headers=headers)
+              response = urllib.request.urlopen(request, timeout=20)
+              body = response.read().decode("utf-8", errors="replace")
+              print(
+                  base,
+                  "status=", response.status,
+                  "content_type=", response.headers.get("Content-Type"),
+                  "length=", len(body),
+                  "json=", body.lstrip().startswith("{"),
+                  "prefix=", repr(body[:120]),
+              )
