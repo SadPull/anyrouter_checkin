@@ -290,17 +290,21 @@ jobs:
                       )
                   },
               )
-              driver.get("https://connect.linux.do/")
-              driver.add_cookie(
+              driver.execute_cdp_cmd("Network.enable", {})
+              cookie_result = driver.execute_cdp_cmd(
+                  "Network.setCookie",
                   {
                       "name": "auth.session-token",
                       "value": token,
-                      "domain": "connect.linux.do",
+                      "url": "https://connect.linux.do/",
                       "path": "/",
                       "secure": True,
                       "httpOnly": True,
-                  }
+                      "sameSite": "Lax",
+                  },
               )
+              if cookie_result.get("success") is False:
+                  raise RuntimeError("Chrome rejected the LinuxDO session cookie")
               driver.get(authorize_url)
               deadline = time.time() + 45
               consent_clicked = False
