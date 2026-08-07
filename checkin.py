@@ -7,7 +7,9 @@ The two sites are both New-API forks but grant the daily bonus differently:
 * AgentRouter has no check-in endpoint at all. The bonus is a side effect of
   authenticating (the server's `DailyCheckinQuota` option), reported back as
   `data.checked_in`. A session cookie therefore cannot trigger it -- it already
-  means "logged in" -- so we replay the LinuxDO OAuth flow to re-authenticate.
+  means "logged in" -- so we replay an OAuth flow (LinuxDO `/api/oauth/linuxdo`
+  or GitHub `/api/oauth/github`, the channel captured in the HAR) to
+  re-authenticate.
 """
 
 from __future__ import annotations
@@ -32,6 +34,17 @@ ANYROUTER_BASE_URL = "https://anyrouter.top"
 AGENTROUTER_BASE_URL = "https://agentrouter.org"
 AGENTROUTER_FALLBACK_BASE_URL = "https://ps.air-outer.com"
 LINUXDO_AUTHORIZE_URL = "https://connect.linux.do/oauth2/authorize"
+GITHUB_AUTHORIZE_URL = "https://github.com/login/oauth/authorize"
+# Login cookies to keep when replaying OAuth on github.com / connect.linux.do.
+# GitHub's user_session is the auth cookie; _gh_sess is the CSRF-coupled
+# session cookie. LinuxDO login is represented by auth.session-token.
+LINUXDO_SESSION_COOKIE_NAMES = {"auth.session-token"}
+GITHUB_SESSION_COOKIE_NAMES = {
+    "user_session",
+    "__Host-user_session_same_site",
+    "_gh_sess",
+    "logged_in",
+}
 PUSHPLUS_URL = "https://www.pushplus.plus/send"
 # Both sites report quota_per_unit = 500000 in /api/status.
 QUOTA_PER_USD = Decimal("500000")
@@ -478,25 +491,31 @@ class AnyRouterProvider(Provider):
 class AgentRouterProvider(Provider):
     """agentrouter.org: no check-in endpoint, the bonus rides on authentication.
 
-    Preferred path replays the LinuxDO OAuth flow with the forum cookie, which
-    re-authenticates the account and grants the bonus. If that cannot complete
-    (Cloudflare, or an interactive consent screen), we fall back to reading the
-    quota with the site cookie and say plainly that no check-in happened.
+    Preferred path replays an OAuth flow -- LinuxDO (/api/oauth/linuxdo) or
+    GitHub (/api/oauth/github, the channel captured in the HAR) -- with the
+    forum/GitHub login cookie to re-authenticate the account and grant the
+    bonus. If that cannot complete (WAF, or an interactive consent screen), we
+    fall back to reading the quota with the site cookie and say plainly that no
+    check-in happened.
     """
 
     name = "AgentRouter"
     env_prefix = "AGENTROUTER"
-    env_keys = ("USER_ID", "COOKIE", "LINUXDO_COOKIE")
+    env_keys = ("USER_ID", "COOKIE", "LINUXDO_COOKIE", "GITHUB_COOKIE")
 
     def accounts(self) -> list[Account]:
         accounts = super().accounts()
         for account in accounts:
-            if not account.values.get("COOKIE") and not account.values.get(
-                "LINUXDO_COOKIE"
-            ):
+            configured = [
+                key
+                for key in ("COOKIE", "LINUXDO_COOKIE", "GITHUB_COOKIE")
+                if account.values.get(key)
+            ]
+            if not configured:
                 raise CheckinError(
-                    f"账号配置不完整：{self.env_prefix}_LINUXDO_COOKIE{account.suffix} "
-                    f"和 {self.env_prefix}_COOKIE{account.suffix} 至少要配一个"
+                    f"账号配置不完整：{self.env_prefix}_COOKIE{account.suffix}、"
+                    f"{self.env_prefix}_LINUXDO_COOKIE{account.suffix}、"
+                    f"{self.env_prefix}_GITHUB_COOKIE{account.suffix} 至少要配一个"
                 )
         return accounts
 
@@ -541,15 +560,21 @@ class AgentRouterProvider(Provider):
             raise CheckinError(f"读取 AgentRouter 用户信息失败：{message}")
         return result["data"]
 
-    def linuxdo_client_id(self, session: Session) -> str:
+    def status_option(self, session: Session, key: str, label: str) -> str:
         result = self.request_json(session, "/api/status")
         data = result.get("data")
-        client_id = ""
+        value = ""
         if isinstance(data, dict):
-            client_id = str(data.get("linuxdo_client_id") or "")
-        if not client_id:
-            raise RelayError("无法从 /api/status 读取 linuxdo_client_id")
-        return client_id
+            value = str(data.get(key) or "")
+        if not value:
+            raise RelayError(f"无法从 /api/status 读取 {label}")
+        return value
+
+    def linuxdo_client_id(self, session: Session) -> str:
+        return self.status_option(session, "linuxdo_client_id", "linuxdo_client_id")
+
+    def github_client_id(self, session: Session) -> str:
+        return self.status_option(session, "github_client_id", "github_client_id")
 
     def oauth_state(self, session: Session) -> str:
         result = self.request_json(session, "/api/oauth/state?mode=login")
@@ -559,28 +584,46 @@ class AgentRouterProvider(Provider):
             raise RelayError(f"获取 OAuth state 失败：{message}")
         return state
 
-    def authorize_code(self, linuxdo_cookie: str, client_id: str, state: str) -> str:
-        """Exchange the LinuxDO cookie for an authorization code.
+    def authorize_code(
+        self, cookie: str, client_id: str, state: str, channel: str
+    ) -> str:
+        """Exchange a forum/GitHub login cookie for an authorization code.
 
-        Unverified in development: connect.linux.do sits behind Cloudflare and
-        refused a cookie-less probe, so this may return the consent page (or be
-        blocked) rather than redirecting. Both cases raise RelayError.
+        The authorize endpoint either redirects with ``code`` in the Location
+        (the app is already approved) or shows a consent page. Both channels
+        are replayed the same way; a non-redirect (consent page / WAF) raises
+        RelayError so the caller can degrade gracefully.
         """
-        query = urllib.parse.urlencode(
-            {"response_type": "code", "client_id": client_id, "state": state}
-        )
-        # A dedicated session: the forum cookie must never leak to AgentRouter.
+        if channel == "github":
+            authorize_url = GITHUB_AUTHORIZE_URL
+            query = urllib.parse.urlencode(
+                {"client_id": client_id, "state": state, "scope": "user:email"}
+            )
+            stable_cookie = select_cookie(cookie, GITHUB_SESSION_COOKIE_NAMES)
+            service = "GitHub"
+            missing = "GitHub Cookie 中缺少登录会话（user_session/_gh_sess）"
+        else:  # linuxdo
+            authorize_url = LINUXDO_AUTHORIZE_URL
+            query = urllib.parse.urlencode(
+                {"response_type": "code", "client_id": client_id, "state": state}
+            )
+            stable_cookie = select_cookie(cookie, LINUXDO_SESSION_COOKIE_NAMES)
+            service = "LinuxDO"
+            missing = "LinuxDO Cookie 中缺少 auth.session-token"
+
+        if not stable_cookie:
+            raise RelayError(missing)
+
+        # A dedicated session: the login cookie must never leak to AgentRouter.
         # Cloudflare clearance cookies are bound to the browser's IP and
         # fingerprint. GitHub Actions uses a different egress (WARP), so
         # replaying cf_clearance/_cfuvid there causes an immediate 403. The
-        # LinuxDO login itself is represented by auth.session-token.
-        stable_cookie = select_cookie(linuxdo_cookie, {"auth.session-token"})
-        if not stable_cookie:
-            raise RelayError("LinuxDO Cookie 中缺少 auth.session-token")
-        forum = Session(base_cookie=stable_cookie, cookie_env="LINUXDO_COOKIE")
+        # LinuxDO login itself is represented by auth.session-token; GitHub by
+        # its user_session cookie.
+        forum = Session(base_cookie=stable_cookie, cookie_env=f"{service.upper()}_COOKIE")
         try:
             status, headers, _ = forum.request_raw(
-                f"{LINUXDO_AUTHORIZE_URL}?{query}",
+                f"{authorize_url}?{query}",
                 headers={
                     "User-Agent": USER_AGENT,
                     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -594,32 +637,38 @@ class AgentRouterProvider(Provider):
                 allow_redirects=False,
             )
         except CookieExpiredError as exc:
-            # 403 here is ambiguous: an expired forum cookie and a Cloudflare
-            # block look identical from the outside. Say both.
+            # 403 here is ambiguous: an expired cookie and a WAF/consent block
+            # look identical from the outside. Say both.
             raise RelayError(
-                f"LinuxDO 授权被拒绝：{exc}。也可能是 Cloudflare 拦截了脚本请求"
+                f"{service} 授权被拒绝：{exc}。也可能是 WAF 拦截了脚本请求"
             ) from exc
-
 
         if not 300 <= status < 400:
             raise RelayError(
-                f"LinuxDO 授权未返回跳转（HTTP {status}）："
-                "可能被 Cloudflare 拦截，或需要在浏览器里手动授权一次"
+                f"{service} 授权未返回跳转（HTTP {status}）："
+                "可能被 WAF 拦截，或需要在浏览器里手动授权一次"
             )
         location = headers.get("Location") or ""
         code = urllib.parse.parse_qs(
             urllib.parse.urlparse(location).query
         ).get("code", [""])[0]
         if not code:
-            raise RelayError(f"LinuxDO 跳转中没有 code 参数：{location or '(空 Location)'}")
+            raise RelayError(f"{service} 跳转中没有 code 参数：{location or '(空 Location)'}")
         return code
 
-    def relay_login(self, session: Session, linuxdo_cookie: str) -> dict[str, Any]:
-        client_id = self.linuxdo_client_id(session)
+    def relay_login(
+        self, session: Session, cookie: str, channel: str
+    ) -> dict[str, Any]:
+        if channel == "github":
+            client_id = self.github_client_id(session)
+            oauth_path = "/api/oauth/github"
+        else:  # linuxdo
+            client_id = self.linuxdo_client_id(session)
+            oauth_path = "/api/oauth/linuxdo"
         state = self.oauth_state(session)
-        code = self.authorize_code(linuxdo_cookie, client_id, state)
+        code = self.authorize_code(cookie, client_id, state, channel)
         query = urllib.parse.urlencode({"code": code, "state": state, "mode": "login"})
-        result = self.request_json(session, f"/api/oauth/linuxdo?{query}")
+        result = self.request_json(session, f"{oauth_path}?{query}")
         if result.get("success") is not True:
             message = str(result.get("message") or "unknown server response")
             raise RelayError(f"OAuth 回调失败：{message}")
@@ -629,41 +678,49 @@ class AgentRouterProvider(Provider):
     def run(self, account: Account) -> AccountReport:
         user_id = account.values.get("USER_ID", "")
         site_cookie = account.values.get("COOKIE", "")
-        linuxdo_cookie = account.values.get("LINUXDO_COOKIE", "")
-        relay_failure = ""
+        channels: list[tuple[str, str, str]] = []
+        if account.values.get("LINUXDO_COOKIE"):
+            channels.append(("LinuxDO", "LINUXDO_COOKIE", "linuxdo"))
+        if account.values.get("GITHUB_COOKIE"):
+            channels.append(("GitHub", "GITHUB_COOKIE", "github"))
 
-        if linuxdo_cookie:
-            session = Session(
-                cookie_env=f"{self.env_prefix}_LINUXDO_COOKIE{account.suffix}"
-            )
-            try:
-                logged_in = self.relay_login(session, linuxdo_cookie)
-                checked_in = bool(logged_in.get("checked_in"))
-                # The relay session is authenticated; read quota through it.
-                user = self.get_user(session, user_id)
-                username = str(
-                    user.get("display_name") or user.get("username") or "Unknown"
+        relay_failures: list[str] = []
+        if channels:
+            for label, env_name, channel in channels:
+                session = Session(
+                    cookie_env=f"{self.env_prefix}_{env_name}{account.suffix}"
                 )
-                message = (
-                    "签到成功，新增额度已到账" if checked_in else "登录成功，今日已签到过"
-                )
-                return AccountReport(
-                    label=account.label,
-                    title=username,
-                    lines=[
-                        f"签到结果：{message}",
-                        f"当前额度：{quota_text(int(user.get('quota', 0)))}",
-                    ],
-                    checked_in=checked_in,
-                )
-            except Exception as exc:
-                relay_failure = str(as_checkin_error(exc))
-                if not site_cookie:
-                    raise CheckinError(f"LinuxDO 签到中继失败：{relay_failure}") from exc
-                print(
-                    f"WARNING [{account.label}]: 中继失败，降级为仅查询额度：{relay_failure}",
-                    file=sys.stderr,
-                )
+                try:
+                    logged_in = self.relay_login(
+                        session, account.values[env_name], channel
+                    )
+                    checked_in = bool(logged_in.get("checked_in"))
+                    # The relay session is authenticated; read quota through it.
+                    user = self.get_user(session, user_id)
+                    username = str(
+                        user.get("display_name") or user.get("username") or "Unknown"
+                    )
+                    message = (
+                        "签到成功，新增额度已到账" if checked_in else "登录成功，今日已签到过"
+                    )
+                    return AccountReport(
+                        label=account.label,
+                        title=username,
+                        lines=[
+                            f"签到结果：{message}",
+                            f"当前额度：{quota_text(int(user.get('quota', 0)))}",
+                        ],
+                        checked_in=checked_in,
+                    )
+                except Exception as exc:
+                    failure = f"{label}：{as_checkin_error(exc)}"
+                    relay_failures.append(failure)
+                    print(
+                        f"WARNING [{account.label}]: {failure}",
+                        file=sys.stderr,
+                    )
+            if not site_cookie:
+                raise CheckinError(f"OAuth 签到中继失败：{'；'.join(relay_failures)}")
 
         # Degraded path: report quota only, and say so.
         session = Session(
@@ -673,11 +730,12 @@ class AgentRouterProvider(Provider):
         user = self.get_user(session, user_id)
         username = str(user.get("display_name") or user.get("username") or "Unknown")
         lines = ["签到结果：未签到（仅查询额度）"]
-        if relay_failure:
-            lines.append(f"中继失败原因：{relay_failure}")
+        if relay_failures:
+            lines.append(f"中继失败原因：{'；'.join(relay_failures)}")
         else:
             lines.append(
-                f"未配置 {self.env_prefix}_LINUXDO_COOKIE{account.suffix}，无法触发签到"
+                f"未配置 {self.env_prefix}_LINUXDO_COOKIE{account.suffix} 或 "
+                f"{self.env_prefix}_GITHUB_COOKIE{account.suffix}，无法触发签到"
             )
         lines.append(f"当前额度：{quota_text(int(user.get('quota', 0)))}")
 
@@ -723,7 +781,7 @@ def run() -> tuple[bool, str, str]:
     if not pending:
         raise CheckinError(
             "未配置任何账号：请设置 ANYROUTER_USER_ID/ANYROUTER_COOKIE "
-            "或 AGENTROUTER_LINUXDO_COOKIE（也支持 ANYROUTER_USER_ID1 这类编号形式）"
+            "AGENTROUTER_LINUXDO_COOKIE 或 AGENTROUTER_GITHUB_COOKIE（也支持 ANYROUTER_USER_ID1 这类编号形式）"
         )
 
     sections = [f"执行时间：{now_text()}（北京时间）"]

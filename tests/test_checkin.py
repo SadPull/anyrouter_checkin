@@ -356,6 +356,106 @@ class AgentRouterTests(unittest.TestCase):
         self.assertIsNone(report.checked_in)
         self.assertIn("未签到", "\n".join(report.lines))
 
+    def account_with_github(self, *, site_cookie="", github_cookie="github-cookie"):
+        return checkin.Account(
+            label="AgentRouter 账号",
+            suffix="",
+            values={
+                "USER_ID": "277969",
+                "COOKIE": site_cookie,
+                "LINUXDO_COOKIE": "",
+                "GITHUB_COOKIE": github_cookie,
+            },
+        )
+
+    def test_github_checked_in_reports_success(self):
+        with patch.object(
+            self.provider, "relay_login", return_value={"checked_in": True}
+        ) as relay_login, patch.object(
+            self.provider,
+            "get_user",
+            return_value={"username": "github-user", "quota": 500000},
+        ):
+            report = self.provider.run(self.account_with_github())
+
+        self.assertIs(report.checked_in, True)
+        self.assertIn("签到成功", "\n".join(report.lines))
+        self.assertEqual(relay_login.call_args.args[2], "github")
+
+    def test_github_selects_session_cookies_not_clearance(self):
+        stable = checkin.select_cookie(
+            "user_session=abc; _gh_sess=def; cf_clearance=bound; _cfuvid=no",
+            checkin.GITHUB_SESSION_COOKIE_NAMES,
+        )
+        self.assertIn("user_session=abc", stable)
+        self.assertIn("_gh_sess=def", stable)
+        self.assertNotIn("cf_clearance", stable)
+        self.assertNotIn("_cfuvid", stable)
+
+    def test_github_authorize_builds_github_url(self):
+        with patch.object(
+            checkin.Session,
+            "request_raw",
+            return_value=(
+                302,
+                {"Location": "https://agentrouter.org/oauth/github?code=abc&state=state"},
+                "",
+            ),
+        ) as request_raw:
+            code = self.provider.authorize_code(
+                "user_session=abc",
+                "Ov23lidtiR4LeVZvVRNL",
+                "state",
+                "github",
+            )
+
+        self.assertEqual(code, "abc")
+        url = request_raw.call_args.args[0]
+        self.assertIn("https://github.com/login/oauth/authorize", url)
+        self.assertIn("client_id=Ov23lidtiR4LeVZvVRNL", url)
+        self.assertIn("scope=user%3Aemail", url)
+        self.assertIn("state=state", url)
+
+    def test_github_client_id_reads_status(self):
+        session = checkin.Session()
+        with patch.object(
+            session,
+            "request_json",
+            return_value={
+                "success": True,
+                "data": {"github_client_id": "Ov23lidtiR4LeVZvVRNL"},
+            },
+        ):
+            self.assertEqual(
+                self.provider.github_client_id(session), "Ov23lidtiR4LeVZvVRNL"
+            )
+
+    def test_github_relay_calls_github_callback(self):
+        session = checkin.Session()
+        with patch.object(
+            self.provider, "github_client_id", return_value="client"
+        ), patch.object(self.provider, "oauth_state", return_value="st"), patch.object(
+            self.provider, "authorize_code", return_value="code"
+        ), patch.object(
+            session,
+            "request_json",
+            return_value={"success": True, "data": {"checked_in": True}},
+        ) as request_json:
+            data = self.provider.relay_login(session, "user_session=x", "github")
+
+        self.assertTrue(data["checked_in"])
+        url = request_json.call_args.args[0]
+        self.assertIn("/api/oauth/github?", url)
+        self.assertIn("code=code", url)
+        self.assertIn("state=st", url)
+        self.assertIn("mode=login", url)
+
+    def test_github_only_relay_failure_without_site_cookie_raises(self):
+        with patch.object(
+            self.provider, "relay_login", side_effect=checkin.RelayError("blocked")
+        ), patch("checkin.sys.stderr", new_callable=io.StringIO):
+            with self.assertRaises(checkin.CheckinError):
+                self.provider.run(self.account_with_github(site_cookie=""))
 
 if __name__ == "__main__":
     unittest.main()
