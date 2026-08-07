@@ -695,6 +695,15 @@ class AgentRouterProvider(Provider):
                         session, account.values[env_name], channel
                     )
                     checked_in = bool(logged_in.get("checked_in"))
+                    relay_name = str(
+                        logged_in.get("display_name")
+                        or logged_in.get("username")
+                        or "未知账号"
+                    )
+                    print(
+                        f"INFO [{account.label}]: {label} 中继登录成功，服务端账号：{relay_name}",
+                        file=sys.stderr,
+                    )
                     # The relay session is authenticated; read quota through it.
                     user = self.get_user(session, user_id)
                     username = str(
@@ -714,6 +723,9 @@ class AgentRouterProvider(Provider):
                     )
                 except Exception as exc:
                     failure = f"{label}：{as_checkin_error(exc)}"
+                    if "relay_name" in locals() and relay_name:
+                        failure += f"（{label} 中继登录到的账号：{relay_name}，" \
+                            "若与要签到的账号不一致，说明该渠道与账号不匹配）"
                     relay_failures.append(failure)
                     print(
                         f"WARNING [{account.label}]: {failure}",
