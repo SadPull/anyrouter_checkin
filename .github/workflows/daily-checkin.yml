@@ -26,35 +26,6 @@ jobs:
         with:
           python-version: "3.x"
 
-      - name: Enable Cloudflare WARP egress
-        shell: bash
-        run: |
-          set -euo pipefail
-          curl -fsSLo /tmp/cloudflare-warp.deb \
-            https://pkg.cloudflareclient.com/pool/noble/main/c/cloudflare-warp/cloudflare-warp_2026.6.880.0_amd64.deb
-          echo '648a7c7e9085f8e50d32a2adcacb0c2049fb72ebeb02ebe913becadee3ab0d4c  /tmp/cloudflare-warp.deb' \
-            | sha256sum -c -
-          sudo apt-get update
-          sudo apt-get install -y /tmp/cloudflare-warp.deb
-          sudo systemctl enable --now warp-svc
-          sudo warp-cli --accept-tos registration new
-          sudo warp-cli --accept-tos mode warp+doh
-          sudo warp-cli --accept-tos connect
-          connected=false
-          for _ in {1..30}; do
-            if sudo warp-cli --accept-tos status | grep -qi connected; then
-              connected=true
-              break
-            fi
-            sleep 2
-          done
-          if [ "$connected" != true ]; then
-            sudo warp-cli --accept-tos status
-            exit 1
-          fi
-          test "$(curl -fsS --retry 5 https://www.cloudflare.com/cdn-cgi/trace \
-            | sed -n 's/^warp=//p')" = on
-
       - name: Run daily check-in
         env:
           # AnyRouter 单账号（旧配置，继续兼容）
@@ -72,39 +43,6 @@ jobs:
           ANYROUTER_COOKIE4: ${{ secrets.ANYROUTER_COOKIE4 }}
           ANYROUTER_USER_ID5: ${{ secrets.ANYROUTER_USER_ID5 }}
           ANYROUTER_COOKIE5: ${{ secrets.ANYROUTER_COOKIE5 }}
-          # AgentRouter 账号：LINUXDO_COOKIE 用于 OAuth 签到中继，COOKIE 是降级路径。
-          # 至少要配一个 cookie；两个都配则优先中继，失败自动降级。
-          AGENTROUTER_USER_ID: ${{ secrets.AGENTROUTER_USER_ID }}
-          AGENTROUTER_LINUXDO_COOKIE: ${{ secrets.AGENTROUTER_LINUXDO_COOKIE }}
-          AGENTROUTER_GITHUB_COOKIE: ${{ secrets.AGENTROUTER_GITHUB_COOKIE }}
-          AGENTROUTER_COOKIE: ${{ secrets.AGENTROUTER_COOKIE }}
-          AGENTROUTER_USER_ID1: ${{ secrets.AGENTROUTER_USER_ID1 }}
-          AGENTROUTER_LINUXDO_COOKIE1: ${{ secrets.AGENTROUTER_LINUXDO_COOKIE1 }}
-          AGENTROUTER_GITHUB_COOKIE1: ${{ secrets.AGENTROUTER_GITHUB_COOKIE1 }}
-          AGENTROUTER_COOKIE1: ${{ secrets.AGENTROUTER_COOKIE1 }}
-          AGENTROUTER_USER_ID2: ${{ secrets.AGENTROUTER_USER_ID2 }}
-          AGENTROUTER_LINUXDO_COOKIE2: ${{ secrets.AGENTROUTER_LINUXDO_COOKIE2 }}
-          AGENTROUTER_GITHUB_COOKIE2: ${{ secrets.AGENTROUTER_GITHUB_COOKIE2 }}
-          AGENTROUTER_COOKIE2: ${{ secrets.AGENTROUTER_COOKIE2 }}
-          AGENTROUTER_USER_ID3: ${{ secrets.AGENTROUTER_USER_ID3 }}
-          AGENTROUTER_LINUXDO_COOKIE3: ${{ secrets.AGENTROUTER_LINUXDO_COOKIE3 }}
-          AGENTROUTER_GITHUB_COOKIE3: ${{ secrets.AGENTROUTER_GITHUB_COOKIE3 }}
-          AGENTROUTER_COOKIE3: ${{ secrets.AGENTROUTER_COOKIE3 }}
-          AGENTROUTER_USER_ID4: ${{ secrets.AGENTROUTER_USER_ID4 }}
-          AGENTROUTER_LINUXDO_COOKIE4: ${{ secrets.AGENTROUTER_LINUXDO_COOKIE4 }}
-          AGENTROUTER_GITHUB_COOKIE4: ${{ secrets.AGENTROUTER_GITHUB_COOKIE4 }}
-          AGENTROUTER_COOKIE4: ${{ secrets.AGENTROUTER_COOKIE4 }}
-          AGENTROUTER_USER_ID5: ${{ secrets.AGENTROUTER_USER_ID5 }}
-          AGENTROUTER_LINUXDO_COOKIE5: ${{ secrets.AGENTROUTER_LINUXDO_COOKIE5 }}
-          AGENTROUTER_GITHUB_COOKIE5: ${{ secrets.AGENTROUTER_GITHUB_COOKIE5 }}
-          AGENTROUTER_COOKIE5: ${{ secrets.AGENTROUTER_COOKIE5 }}
-          # PushPlus 推送（所有站点共用一个 token）
+          # PushPlus 推送通知
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
         run: python checkin.py
-
-      - name: Disconnect Cloudflare WARP
-        if: always()
-        shell: bash
-        run: |
-          sudo warp-cli --accept-tos disconnect || true
-          sudo warp-cli --accept-tos registration delete || true

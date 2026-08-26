@@ -1,15 +1,8 @@
 #!/usr/bin/env python3
-"""Daily check-in for AnyRouter and AgentRouter with PushPlus notification.
+"""Daily check-in for the New-API relay site with PushPlus notification.
 
-The two sites are both New-API forks but grant the daily bonus differently:
-
-* AnyRouter exposes `POST /api/user/sign_in`, so a saved session cookie is enough.
-* AgentRouter has no check-in endpoint at all. The bonus is a side effect of
-  authenticating (the server's `DailyCheckinQuota` option), reported back as
-  `data.checked_in`. A session cookie therefore cannot trigger it -- it already
-  means "logged in" -- so we replay an OAuth flow (LinuxDO `/api/oauth/linuxdo`
-  or GitHub `/api/oauth/github`, the channel captured in the HAR) to
-  re-authenticate.
+The site exposes `POST /api/user/sign_in`, so a saved session cookie is
+enough to claim the daily bonus.
 """
 
 from __future__ import annotations
@@ -21,7 +14,6 @@ import re
 import sys
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -31,22 +23,8 @@ from zoneinfo import ZoneInfo
 
 
 ANYROUTER_BASE_URL = "https://anyrouter.top"
-AGENTROUTER_BASE_URL = "https://agentrouter.org"
-AGENTROUTER_FALLBACK_BASE_URL = "https://ps.air-outer.com"
-LINUXDO_AUTHORIZE_URL = "https://connect.linux.do/oauth2/authorize"
-GITHUB_AUTHORIZE_URL = "https://github.com/login/oauth/authorize"
-# Login cookies to keep when replaying OAuth on github.com / connect.linux.do.
-# GitHub's user_session is the auth cookie; _gh_sess is the CSRF-coupled
-# session cookie. LinuxDO login is represented by auth.session-token.
-LINUXDO_SESSION_COOKIE_NAMES = {"auth.session-token"}
-GITHUB_SESSION_COOKIE_NAMES = {
-    "user_session",
-    "__Host-user_session_same_site",
-    "_gh_sess",
-    "logged_in",
-}
 PUSHPLUS_URL = "https://www.pushplus.plus/send"
-# Both sites report quota_per_unit = 500000 in /api/status.
+# The site reports quota_per_unit = 500000 in /api/status.
 QUOTA_PER_USD = Decimal("500000")
 TIMEOUT_SECONDS = 15
 MAX_ATTEMPTS = 3
@@ -56,7 +34,7 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/150.0.0.0 Safari/537.36"
 )
-# Aliyun WAF challenge, served by both sites.
+# Aliyun WAF challenge served by the site.
 ACW_POSITIONS = [
     15, 35, 29, 24, 33, 16, 1, 38, 10, 9, 19, 31, 40, 27, 22, 23, 25, 13,
     6, 11, 39, 18, 20, 8, 14, 21, 32, 26, 2, 30, 7, 4, 17, 5, 3, 28, 34,
@@ -64,6 +42,7 @@ ACW_POSITIONS = [
 ]
 ACW_XOR_KEY = "3000176000856006061501533003690027800375"
 AUTH_FAILURE_HINTS = ("未登录", "无权", "登录已过期", "token 无效", "无效的 token")
+
 
 class CheckinError(RuntimeError):
     """A user-facing error that is safe to print in CI logs."""
@@ -75,10 +54,6 @@ class WafBlockedError(CheckinError):
 
 class CookieExpiredError(CheckinError):
     """A configured cookie is no longer valid and must be re-copied."""
-
-
-class RelayError(CheckinError):
-    """The AgentRouter OAuth relay could not complete; caller may degrade."""
 
 
 def solve_acw_cookie(arg1: str) -> str:
@@ -97,19 +72,6 @@ def merge_cookie(cookie: str, name: str, value: str) -> str:
     parts = [part for part in parts if part.split("=", 1)[0].strip() != name]
     parts.append(f"{name}={value}")
     return "; ".join(parts)
-
-
-def select_cookie(cookie: str, allowed_names: set[str]) -> str:
-    """Keep only stable cookies needed by a cross-network auth request."""
-    selected: list[str] = []
-    for part in cookie.split(";"):
-        part = part.strip()
-        if "=" not in part:
-            continue
-        name = part.split("=", 1)[0].strip()
-        if name in allowed_names:
-            selected.append(part)
-    return "; ".join(selected)
 
 
 def is_html(text: str, headers: Any = None) -> bool:
@@ -150,25 +112,10 @@ def looks_unauthenticated(text: str, message: str) -> bool:
     return is_html(text)
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """Surface 3xx responses instead of following them.
-
-    The OAuth relay needs the `code` query parameter out of the Location
-    header; letting urllib follow the hop would lose it.
-    """
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
-
 
 @dataclass
 class Session:
-    """Per-account HTTP state: cookies stay isolated between accounts.
-
-    The AgentRouter relay also depends on this: the `session` cookie handed
-    out with the OAuth state token must be sent back on the callback, because
-    the server validates the state against it.
-    """
+    """Per-account HTTP state: cookies stay isolated between accounts."""
 
     base_cookie: str = ""
     # Names the env var this cookie came from, so expiry errors can point at it.
@@ -200,7 +147,6 @@ class Session:
         headers: dict[str, str] | None = None,
         payload: dict[str, Any] | None = None,
         attempts: int = MAX_ATTEMPTS,
-        allow_redirects: bool = True,
     ) -> tuple[int, Any, str]:
         body = None
         request_headers = dict(headers or {})
@@ -208,9 +154,7 @@ class Session:
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             request_headers.setdefault("Content-Type", "application/json; charset=utf-8")
 
-        opener = urllib.request.build_opener(
-            *([] if allow_redirects else [_NoRedirect])
-        )
+        opener = urllib.request.build_opener()
         challenge_retried = False
         attempt = 0
         while attempt < attempts:
@@ -250,9 +194,6 @@ class Session:
 
                     return response.status, response.headers, text
             except urllib.error.HTTPError as exc:
-                if not allow_redirects and 300 <= exc.code < 400:
-                    self._capture_set_cookie(exc.headers)
-                    return exc.code, exc.headers, ""
                 if exc.code in (401, 403):
                     self._capture_set_cookie(exc.headers)
                     error_text = decode_body(
@@ -488,279 +429,7 @@ class AnyRouterProvider(Provider):
         )
 
 
-class AgentRouterProvider(Provider):
-    """agentrouter.org: no check-in endpoint, the bonus rides on authentication.
-
-    Preferred path replays an OAuth flow -- LinuxDO (/api/oauth/linuxdo) or
-    GitHub (/api/oauth/github, the channel captured in the HAR) -- with the
-    forum/GitHub login cookie to re-authenticate the account and grant the
-    bonus. If that cannot complete (WAF, or an interactive consent screen), we
-    fall back to reading the quota with the site cookie and say plainly that no
-    check-in happened.
-    """
-
-    name = "AgentRouter"
-    env_prefix = "AGENTROUTER"
-    env_keys = ("USER_ID", "COOKIE", "LINUXDO_COOKIE", "GITHUB_COOKIE")
-
-    def accounts(self) -> list[Account]:
-        accounts = super().accounts()
-        for account in accounts:
-            configured = [
-                key
-                for key in ("COOKIE", "LINUXDO_COOKIE", "GITHUB_COOKIE")
-                if account.values.get(key)
-            ]
-            if not configured:
-                raise CheckinError(
-                    f"账号配置不完整：{self.env_prefix}_COOKIE{account.suffix}、"
-                    f"{self.env_prefix}_LINUXDO_COOKIE{account.suffix}、"
-                    f"{self.env_prefix}_GITHUB_COOKIE{account.suffix} 至少要配一个"
-                )
-        return accounts
-
-    def api_headers(
-        self, user_id: str, base_url: str = AGENTROUTER_BASE_URL
-    ) -> dict[str, str]:
-        headers = {
-            "Accept": "application/json, text/plain, */*",
-            "Cache-Control": "no-store",
-            "User-Agent": USER_AGENT,
-            "Referer": f"{base_url}/console",
-        }
-        if user_id:
-            headers["New-API-User"] = user_id
-        return headers
-
-    def request_json(
-        self,
-        session: Session,
-        path: str,
-        *,
-        user_id: str = "",
-    ) -> dict[str, Any]:
-        """Use the official backup domain when the primary is WAF-blocked."""
-        blocked: WafBlockedError | None = None
-        for base_url in (AGENTROUTER_BASE_URL, AGENTROUTER_FALLBACK_BASE_URL):
-            try:
-                return session.request_json(
-                    f"{base_url}{path}",
-                    headers=self.api_headers(user_id, base_url),
-                )
-            except WafBlockedError as exc:
-                blocked = exc
-                continue
-        assert blocked is not None
-        raise blocked
-
-    def get_user(self, session: Session, user_id: str) -> dict[str, Any]:
-        result = self.request_json(session, "/api/user/self", user_id=user_id)
-        if result.get("success") is not True or not isinstance(result.get("data"), dict):
-            message = str(result.get("message") or "unknown server response")
-            raise CheckinError(f"读取 AgentRouter 用户信息失败：{message}")
-        return result["data"]
-
-    def status_option(self, session: Session, key: str, label: str) -> str:
-        result = self.request_json(session, "/api/status")
-        data = result.get("data")
-        value = ""
-        if isinstance(data, dict):
-            value = str(data.get(key) or "")
-        if not value:
-            raise RelayError(f"无法从 /api/status 读取 {label}")
-        return value
-
-    def linuxdo_client_id(self, session: Session) -> str:
-        return self.status_option(session, "linuxdo_client_id", "linuxdo_client_id")
-
-    def github_client_id(self, session: Session) -> str:
-        return self.status_option(session, "github_client_id", "github_client_id")
-
-    def oauth_state(self, session: Session) -> str:
-        result = self.request_json(session, "/api/oauth/state?mode=login")
-        state = str(result.get("data") or "")
-        if result.get("success") is not True or not state:
-            message = str(result.get("message") or "unknown server response")
-            raise RelayError(f"获取 OAuth state 失败：{message}")
-        return state
-
-    def authorize_code(
-        self, cookie: str, client_id: str, state: str, channel: str
-    ) -> str:
-        """Exchange a forum/GitHub login cookie for an authorization code.
-
-        The authorize endpoint either redirects with ``code`` in the Location
-        (the app is already approved) or shows a consent page. Both channels
-        are replayed the same way; a non-redirect (consent page / WAF) raises
-        RelayError so the caller can degrade gracefully.
-        """
-        if channel == "github":
-            authorize_url = GITHUB_AUTHORIZE_URL
-            query = urllib.parse.urlencode(
-                {"client_id": client_id, "state": state, "scope": "user:email"}
-            )
-            stable_cookie = select_cookie(cookie, GITHUB_SESSION_COOKIE_NAMES)
-            service = "GitHub"
-            missing = "GitHub Cookie 中缺少登录会话（user_session/_gh_sess）"
-        else:  # linuxdo
-            authorize_url = LINUXDO_AUTHORIZE_URL
-            query = urllib.parse.urlencode(
-                {"response_type": "code", "client_id": client_id, "state": state}
-            )
-            stable_cookie = select_cookie(cookie, LINUXDO_SESSION_COOKIE_NAMES)
-            service = "LinuxDO"
-            missing = "LinuxDO Cookie 中缺少 auth.session-token"
-
-        if not stable_cookie:
-            raise RelayError(missing)
-
-        # A dedicated session: the login cookie must never leak to AgentRouter.
-        # Cloudflare clearance cookies are bound to the browser's IP and
-        # fingerprint. GitHub Actions uses a different egress (WARP), so
-        # replaying cf_clearance/_cfuvid there causes an immediate 403. The
-        # LinuxDO login itself is represented by auth.session-token; GitHub by
-        # its user_session cookie.
-        forum = Session(base_cookie=stable_cookie, cookie_env=f"{service.upper()}_COOKIE")
-        try:
-            status, headers, _ = forum.request_raw(
-                f"{authorize_url}?{query}",
-                headers={
-                    "User-Agent": USER_AGENT,
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                    "Accept-Language": "zh-CN,zh;q=0.9",
-                    "Sec-Fetch-Dest": "document",
-                    "Sec-Fetch-Mode": "navigate",
-                    "Sec-Fetch-Site": "cross-site",
-                    "Upgrade-Insecure-Requests": "1",
-                },
-                attempts=1,
-                allow_redirects=False,
-            )
-        except CookieExpiredError as exc:
-            # 403 here is ambiguous: an expired cookie and a WAF/consent block
-            # look identical from the outside. Say both.
-            raise RelayError(
-                f"{service} 授权被拒绝：{exc}。也可能是 WAF 拦截了脚本请求"
-            ) from exc
-
-        if not 300 <= status < 400:
-            raise RelayError(
-                f"{service} 授权未返回跳转（HTTP {status}）："
-                "可能被 WAF 拦截，或需要在浏览器里手动授权一次"
-            )
-        location = headers.get("Location") or ""
-        code = urllib.parse.parse_qs(
-            urllib.parse.urlparse(location).query
-        ).get("code", [""])[0]
-        if not code:
-            raise RelayError(f"{service} 跳转中没有 code 参数：{location or '(空 Location)'}")
-        return code
-
-    def relay_login(
-        self, session: Session, cookie: str, channel: str
-    ) -> dict[str, Any]:
-        if channel == "github":
-            client_id = self.github_client_id(session)
-            oauth_path = "/api/oauth/github"
-        else:  # linuxdo
-            client_id = self.linuxdo_client_id(session)
-            oauth_path = "/api/oauth/linuxdo"
-        state = self.oauth_state(session)
-        code = self.authorize_code(cookie, client_id, state, channel)
-        query = urllib.parse.urlencode({"code": code, "state": state, "mode": "login"})
-        result = self.request_json(session, f"{oauth_path}?{query}")
-        if result.get("success") is not True:
-            message = str(result.get("message") or "unknown server response")
-            raise RelayError(f"OAuth 回调失败：{message}")
-        data = result.get("data")
-        return data if isinstance(data, dict) else {}
-
-    def run(self, account: Account) -> AccountReport:
-        user_id = account.values.get("USER_ID", "")
-        site_cookie = account.values.get("COOKIE", "")
-        channels: list[tuple[str, str, str]] = []
-        if account.values.get("LINUXDO_COOKIE"):
-            channels.append(("LinuxDO", "LINUXDO_COOKIE", "linuxdo"))
-        if account.values.get("GITHUB_COOKIE"):
-            channels.append(("GitHub", "GITHUB_COOKIE", "github"))
-
-        relay_failures: list[str] = []
-        if channels:
-            for label, env_name, channel in channels:
-                session = Session(
-                    cookie_env=f"{self.env_prefix}_{env_name}{account.suffix}"
-                )
-                try:
-                    logged_in = self.relay_login(
-                        session, account.values[env_name], channel
-                    )
-                    checked_in = bool(logged_in.get("checked_in"))
-                    relay_name = str(
-                        logged_in.get("display_name")
-                        or logged_in.get("username")
-                        or "未知账号"
-                    )
-                    print(
-                        f"INFO [{account.label}]: {label} 中继登录成功，服务端账号：{relay_name}",
-                        file=sys.stderr,
-                    )
-                    # The relay session is authenticated; read quota through it.
-                    user = self.get_user(session, user_id)
-                    username = str(
-                        user.get("display_name") or user.get("username") or "Unknown"
-                    )
-                    message = (
-                        "签到成功，新增额度已到账" if checked_in else "登录成功，今日已签到过"
-                    )
-                    return AccountReport(
-                        label=account.label,
-                        title=username,
-                        lines=[
-                            f"签到结果：{message}",
-                            f"当前额度：{quota_text(int(user.get('quota', 0)))}",
-                        ],
-                        checked_in=checked_in,
-                    )
-                except Exception as exc:
-                    failure = f"{label}：{as_checkin_error(exc)}"
-                    if "relay_name" in locals() and relay_name:
-                        failure += f"（{label} 中继登录到的账号：{relay_name}，" \
-                            "若与要签到的账号不一致，说明该渠道与账号不匹配）"
-                    relay_failures.append(failure)
-                    print(
-                        f"WARNING [{account.label}]: {failure}",
-                        file=sys.stderr,
-                    )
-            if not site_cookie:
-                raise CheckinError(f"OAuth 签到中继失败：{'；'.join(relay_failures)}")
-
-        # Degraded path: report quota only, and say so.
-        session = Session(
-            base_cookie=site_cookie,
-            cookie_env=f"{self.env_prefix}_COOKIE{account.suffix}",
-        )
-        user = self.get_user(session, user_id)
-        username = str(user.get("display_name") or user.get("username") or "Unknown")
-        lines = ["签到结果：未签到（仅查询额度）"]
-        if relay_failures:
-            lines.append(f"中继失败原因：{'；'.join(relay_failures)}")
-        else:
-            lines.append(
-                f"未配置 {self.env_prefix}_LINUXDO_COOKIE{account.suffix} 或 "
-                f"{self.env_prefix}_GITHUB_COOKIE{account.suffix}，无法触发签到"
-            )
-        lines.append(f"当前额度：{quota_text(int(user.get('quota', 0)))}")
-
-        return AccountReport(
-            label=account.label,
-            title=username,
-            lines=lines,
-            checked_in=None,
-            warning=f"{account.label} 未完成签到",
-        )
-
-
-PROVIDERS: tuple[Provider, ...] = (AnyRouterProvider(), AgentRouterProvider())
+PROVIDERS: tuple[Provider, ...] = (AnyRouterProvider(),)
 
 
 def send_pushplus(token: str, title: str, content: str) -> None:
@@ -792,8 +461,7 @@ def run() -> tuple[bool, str, str]:
 
     if not pending:
         raise CheckinError(
-            "未配置任何账号：请设置 ANYROUTER_USER_ID/ANYROUTER_COOKIE "
-            "AGENTROUTER_LINUXDO_COOKIE 或 AGENTROUTER_GITHUB_COOKIE（也支持 ANYROUTER_USER_ID1 这类编号形式）"
+            "未配置任何账号：请设置 ANYROUTER_USER_ID/ANYROUTER_COOKIE（也支持 ANYROUTER_USER_ID1 这类编号形式）"
         )
 
     sections = [f"执行时间：{now_text()}（北京时间）"]
