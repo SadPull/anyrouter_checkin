@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
-"""Daily check-in for the New-API relay site with PushPlus notification.
+"""Daily check-in for several relay sites with PushPlus notification.
 
-The site exposes `POST /api/user/sign_in`, so a saved session cookie is
-enough to claim the daily bonus.
+Two kinds of sites are supported:
+
+- AnyRouter: exposes `POST /api/user/sign_in`, so a saved session cookie is
+  enough to claim the daily bonus.
+- New-API v1 sites (Justwoker / Gorouter / Tabitoken): expose
+  `POST /api/user/checkin`, authenticated with a personal access token
+  (Bearer) or a refresh cookie; the POST may require a Cloudflare Turnstile
+  token, minted inside a real Chrome driven over the DevTools protocol
+  (playwright chromium fallback where Chrome is absent, e.g. CI).
 """
 
 from __future__ import annotations
@@ -11,9 +18,13 @@ import gzip
 import json
 import os
 import re
+import socket
+import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -42,6 +53,20 @@ ACW_POSITIONS = [
 ]
 ACW_XOR_KEY = "3000176000856006061501533003690027800375"
 AUTH_FAILURE_HINTS = ("未登录", "无权", "登录已过期", "token 无效", "无效的 token")
+# New-API check-in POST retries: a Turnstile token is single-use, so every
+# attempt mints a fresh one.
+CHECKIN_ATTEMPTS = 3
+BROWSER_NAV_TIMEOUT_MS = 60_000
+TURNSTILE_SCRIPT_TIMEOUT_MS = 20_000
+TURNSTILE_TOKEN_TIMEOUT_MS = 45_000
+# A Cloudflare interstitial usually clears by itself in a real browser.
+CF_SETTLE_SECONDS = 45
+# (显示名, 站点地址, 环境变量前缀)
+NEW_API_SITES = (
+    ("Justwoker", "https://api.justwoker.icu", "JUSTWOKER"),
+    ("Gorouter", "https://gorouter.app", "GOROUTER"),
+    ("Tabitoken", "https://tabitoken.com", "TABITOKEN"),
+)
 
 
 class CheckinError(RuntimeError):
@@ -54,6 +79,10 @@ class WafBlockedError(CheckinError):
 
 class CookieExpiredError(CheckinError):
     """A configured cookie is no longer valid and must be re-copied."""
+
+
+class TurnstileRequiredError(CheckinError):
+    """The site demands a Turnstile token but the HTTP channel cannot mint one."""
 
 
 def solve_acw_cookie(arg1: str) -> str:
@@ -121,6 +150,9 @@ class Session:
     # Names the env var this cookie came from, so expiry errors can point at it.
     cookie_env: str = ""
     extra_cookies: dict[str, str] = field(default_factory=dict)
+    # Appended to expiry errors; sites using tokens need different advice
+    # than sites using browser cookies.
+    expiry_hint: str = ""
 
     def cookie_header(self) -> str:
         cookie = self.base_cookie
@@ -136,8 +168,9 @@ class Session:
                 self.extra_cookies[name.strip()] = value.strip()
 
     def expired(self, detail: str) -> CookieExpiredError:
-        target = self.cookie_env or "对应的 Cookie 环境变量"
-        return CookieExpiredError(f"{target} 已失效，请从浏览器重新复制（{detail}）")
+        target = self.cookie_env or "对应的凭证环境变量"
+        hint = self.expiry_hint or "请从浏览器重新复制"
+        return CookieExpiredError(f"{target} 已失效（{detail}），{hint}")
 
     def request_raw(
         self,
@@ -284,8 +317,8 @@ def decode_body(raw: bytes, headers: Any, method: str, url: str) -> str:
         return raw.decode("utf-8", errors="replace")
 
 
-def quota_text(value: int) -> str:
-    usd = Decimal(value) / QUOTA_PER_USD
+def quota_text(value: int, per_unit: Decimal = QUOTA_PER_USD) -> str:
+    usd = Decimal(value) / per_unit
     return f"{value} (${usd.quantize(Decimal('0.01'))})"
 
 
@@ -429,7 +462,665 @@ class AnyRouterProvider(Provider):
         )
 
 
-PROVIDERS: tuple[Provider, ...] = (AnyRouterProvider(),)
+class HttpApi:
+    """Plain urllib transport for New-API sites.
+
+    Auth is a Bearer personal access token (preferred) or a JWT minted from
+    a refresh cookie. Raises WafBlockedError when Cloudflare interposes, so
+    the caller can switch to BrowserApi.
+    """
+
+    transport_name = "http"
+
+    def __init__(
+        self,
+        session: Session,
+        base_url: str,
+        token: str = "",
+        user_id: str = "",
+    ) -> None:
+        self.session = session
+        self.base_url = base_url.rstrip("/")
+        self.token = token
+        self.user_id = user_id
+
+    def headers(self) -> dict[str, str]:
+        headers = {
+            "Accept": "application/json",
+            "Cache-Control": "no-store",
+            "User-Agent": USER_AGENT,
+        }
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        if self.user_id:
+            headers["New-Api-User"] = self.user_id
+        return headers
+
+    def request(self, method: str, path: str, payload: dict | None = None) -> dict:
+        return self.session.request_json(
+            self.base_url + path,
+            method=method,
+            headers=self.headers(),
+            payload=payload,
+        )
+
+    def refresh_token(self) -> None:
+        result = self.request("POST", "/api/user/auth/refresh")
+        token = str((result.get("data") or {}).get("access_token") or "")
+        if result.get("success") is not True or not token:
+            raise self.session.expired(
+                str(result.get("message") or "刷新响应缺少 access_token")
+            )
+        self.token = token
+
+    def mint_turnstile(self, sitekey: str) -> str:
+        raise TurnstileRequiredError("站点要求 Turnstile 校验，HTTP 通道无法生成令牌")
+
+    def close(self) -> None:
+        pass
+
+
+TURNSTILE_MINT_JS = """
+async (sitekey) => {
+  if (!window.turnstile) {
+    await new Promise((resolve, reject) => {
+      const script = document.createElement('script');
+      script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+      script.onload = resolve;
+      script.onerror = () => reject(new Error('Turnstile 脚本加载失败'));
+      document.head.appendChild(script);
+      setTimeout(() => reject(new Error('Turnstile 脚本加载超时')), 20000);
+    });
+  }
+  const holder = document.createElement('div');
+  document.body.appendChild(holder);
+  try {
+    return await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('等待 Turnstile 令牌超时')), 45000);
+      window.turnstile.render(holder, {
+        sitekey: sitekey,
+        callback: (value) => { clearTimeout(timer); resolve(value); },
+        'error-callback': (code) => { clearTimeout(timer); reject(new Error('Turnstile 错误码: ' + code)); },
+        'expired-callback': () => { clearTimeout(timer); reject(new Error('Turnstile 令牌已过期')); },
+      });
+    });
+  } finally {
+    holder.remove();
+  }
+}
+"""
+
+BROWSER_FETCH_JS = """
+async ({path, method, token, userId, payload}) => {
+  const headers = {Accept: 'application/json'};
+  if (token) headers['Authorization'] = 'Bearer ' + token;
+  if (userId) headers['New-Api-User'] = userId;
+  let body;
+  if (payload !== null && payload !== undefined) {
+    headers['Content-Type'] = 'application/json';
+    body = JSON.stringify(payload);
+  }
+  const response = await fetch(path, {
+    method: method, headers: headers, body: body, credentials: 'include',
+  });
+  const text = await response.text();
+  return {status: response.status, text: text};
+}
+"""
+
+
+class BrowserApi:
+    """Real-Chrome-over-CDP transport (playwright chromium fallback).
+
+    The browser is only started when needed (site blocked HTTP or the
+    check-in POST requires Turnstile). API calls run as same-origin fetches
+    inside the page, so Cloudflare cookies travel with them.
+
+    A real Chrome binary launched as a plain subprocess (no automation
+    flags, dedicated profile) and driven over the DevTools protocol keeps a
+    clean fingerprint: Cloudflare serves its invisible managed challenge
+    and Turnstile mints tokens non-interactively. Playwright-launched
+    chromium gets an interactive challenge it can never pass, so it is only
+    a fallback for environments without a Chrome install (CI).
+    """
+
+    transport_name = "browser"
+
+    def __init__(
+        self,
+        session: Session,
+        base_url: str,
+        token: str = "",
+        user_id: str = "",
+        cookie: str = "",
+    ) -> None:
+        self._session = session
+        self.base_url = base_url.rstrip("/")
+        self.token = token
+        self.user_id = user_id
+        self.cookie = cookie.strip()
+        self._playwright: Any = None
+        self._browser: Any = None
+        self._context: Any = None
+        self._page: Any = None
+        self._chrome_proc: Any = None
+
+    def request(self, method: str, path: str, payload: dict | None = None) -> dict:
+        self._ensure_page()
+        try:
+            raw = self._page.evaluate(
+                BROWSER_FETCH_JS,
+                {
+                    "path": path,
+                    "method": method,
+                    "token": self.token,
+                    "userId": self.user_id,
+                    "payload": payload,
+                },
+            )
+        except Exception as exc:
+            raise CheckinError(f"浏览器请求 {path} 失败：{exc}") from exc
+        text = str(raw.get("text") or "")
+        if is_html(text) and expects_json({"Accept": "application/json"}):
+            if looks_login_page(text):
+                raise self._session.expired(f"{method} {path} 返回了登录页")
+            raise WafBlockedError(
+                f"{method} {path} 返回了 HTML 而不是 JSON"
+                f"（浏览器通道，HTTP {raw.get('status')}）"
+            )
+        try:
+            result = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise CheckinError(
+                f"{method} {path} returned non-JSON content (HTTP {raw.get('status')})"
+            ) from exc
+        if not isinstance(result, dict):
+            raise CheckinError(f"{method} {path} returned a non-object JSON value")
+        if result.get("success") is not True and looks_unauthenticated(
+            text, str(result.get("message") or "")
+        ):
+            raise self._session.expired(str(result.get("message") or "接口拒绝了当前凭证"))
+        return result
+
+    def refresh_token(self) -> None:
+        self._ensure_page()
+        result = self.request("POST", "/api/user/auth/refresh")
+        token = str((result.get("data") or {}).get("access_token") or "")
+        if result.get("success") is not True or not token:
+            raise self._session.expired(
+                str(result.get("message") or "刷新响应缺少 access_token")
+            )
+        self.token = token
+
+    def mint_turnstile(self, sitekey: str) -> str:
+        self._ensure_page()
+        last_error: Exception = CheckinError("未尝试")
+        for attempt in range(2):
+            if attempt:
+                self._reload_page()
+            try:
+                token = self._page.evaluate(TURNSTILE_MINT_JS, sitekey)
+            except Exception as exc:
+                last_error = exc
+                continue
+            if token:
+                return str(token)
+            last_error = CheckinError("Turnstile 未返回令牌")
+        raise CheckinError(f"Turnstile 令牌获取失败：{last_error}")
+
+    def close(self) -> None:
+        for resource in (self._browser, self._playwright):
+            try:
+                if resource is not None:
+                    resource.close()
+            except Exception:
+                pass
+        try:
+            if self._playwright is not None:
+                self._playwright.stop()
+        except Exception:
+            pass
+        if self._chrome_proc is not None:
+            try:
+                self._chrome_proc.terminate()
+                self._chrome_proc.wait(timeout=10)
+            except Exception:
+                try:
+                    self._chrome_proc.kill()
+                except Exception:
+                    pass
+        self._page = self._context = self._browser = self._playwright = None
+        self._chrome_proc = None
+
+    def _ensure_page(self) -> None:
+        if self._page is not None:
+            return
+        sync_playwright = _load_playwright()
+        self._playwright = sync_playwright().start()
+        chrome_exe = _find_chrome()
+        if chrome_exe:
+            try:
+                self._launch_real_chrome(chrome_exe)
+            except Exception:
+                self._teardown_browser()
+                self._launch_playwright_chromium()
+        else:
+            # No real Chrome (CI runner): headed chromium under xvfb.
+            self._launch_playwright_chromium()
+        if self.cookie:
+            self._context.add_cookies(self._context_cookies())
+        self._page = self._context.new_page()
+        self._page.goto(
+            self.base_url + "/",
+            wait_until="domcontentloaded",
+            timeout=BROWSER_NAV_TIMEOUT_MS,
+        )
+        self._wait_cloudflare_settled()
+
+    def _launch_real_chrome(self, chrome_exe: str) -> None:
+        profile = os.environ.get("CHECKIN_CHROME_PROFILE") or os.path.join(
+            tempfile.gettempdir(), "checkin-chrome-profile"
+        )
+        os.makedirs(profile, exist_ok=True)
+        port = _free_port()
+        self._chrome_proc = subprocess.Popen(
+            [
+                chrome_exe,
+                f"--remote-debugging-port={port}",
+                f"--user-data-dir={profile}",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-session-crashed-bubble",
+                "--window-size=1280,800",
+                "about:blank",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        endpoint = f"http://127.0.0.1:{port}"
+        deadline = time.time() + 30
+        last_error: Exception = CheckinError("未尝试")
+        while time.time() < deadline:
+            if self._chrome_proc.poll() is not None:
+                raise CheckinError("Chrome 进程提前退出")
+            try:
+                self._browser = self._playwright.chromium.connect_over_cdp(
+                    endpoint, timeout=3000
+                )
+                break
+            except Exception as exc:
+                last_error = exc
+                time.sleep(0.6)
+        else:
+            raise CheckinError(f"连接 Chrome DevTools 失败：{last_error}")
+        if self._browser.contexts:
+            self._context = self._browser.contexts[0]
+        else:
+            self._context = self._browser.new_context()
+
+    def _launch_playwright_chromium(self) -> None:
+        # Under xvfb (CI) DISPLAY exists and a headed browser passes
+        # Cloudflare/Turnstile more reliably; headless elsewhere.
+        headless = not os.environ.get("DISPLAY")
+        launch_args = ["--disable-blink-features=AutomationControlled"]
+        try:
+            self._browser = self._playwright.chromium.launch(
+                channel="chrome", headless=headless, args=launch_args
+            )
+        except Exception:
+            self._browser = self._playwright.chromium.launch(
+                headless=headless, args=launch_args
+            )
+        self._context = self._browser.new_context(
+            user_agent=USER_AGENT,
+            locale="zh-CN",
+            timezone_id="Asia/Shanghai",
+            viewport={"width": 1280, "height": 800},
+        )
+
+    def _teardown_browser(self) -> None:
+        for resource in (self._browser, self._playwright):
+            try:
+                if resource is not None:
+                    resource.close()
+            except Exception:
+                pass
+        try:
+            if self._playwright is not None:
+                self._playwright.stop()
+        except Exception:
+            pass
+        if self._chrome_proc is not None:
+            try:
+                self._chrome_proc.terminate()
+            except Exception:
+                pass
+        self._page = self._context = self._browser = self._playwright = None
+        self._chrome_proc = None
+
+    def _reload_page(self) -> None:
+        self._page.reload(
+            wait_until="domcontentloaded", timeout=BROWSER_NAV_TIMEOUT_MS
+        )
+        self._wait_cloudflare_settled()
+
+    def _wait_cloudflare_settled(self) -> None:
+        deadline = time.time() + CF_SETTLE_SECONDS
+        while time.time() < deadline:
+            try:
+                title = (self._page.title() or "").strip().lower()
+            except Exception:
+                title = "unknown"
+            if title and not any(
+                marker in title
+                for marker in ("just a moment", "attention required", "请稍候")
+            ):
+                return
+            self._page.wait_for_timeout(1500)
+
+    def _context_cookies(self) -> list[dict[str, Any]]:
+        host = urllib.parse.urlparse(self.base_url).hostname or ""
+        if "=" in self.cookie:
+            pairs = [pair.strip() for pair in self.cookie.split(";") if "=" in pair]
+            return [
+                {
+                    "name": name.strip(),
+                    "value": value.strip(),
+                    "domain": host,
+                    "path": "/",
+                    "secure": True,
+                }
+                for name, value in (pair.split("=", 1) for pair in pairs)
+            ]
+        return [
+            {
+                "name": "new_api_refresh",
+                "value": self.cookie,
+                "domain": host,
+                "path": "/",
+                "secure": True,
+            }
+        ]
+
+
+def _load_playwright():
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise CheckinError(
+            "需要 playwright 浏览器通道：先 pip install playwright，"
+            "再 python -m playwright install chromium"
+        ) from exc
+    return sync_playwright
+
+
+def _find_chrome() -> str:
+    """Locate a real Chrome install; empty string when none exists."""
+    candidates = [
+        os.environ.get("CHECKIN_CHROME_PATH", ""),
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    ]
+    for path in candidates:
+        if path and os.path.exists(path):
+            return path
+    return ""
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+class NewApiCheckinProvider(Provider):
+    """New-API v1 sites: GET/POST /api/user/checkin with token or cookie auth.
+
+    The POST accepts a Turnstile token as a query parameter when the site
+    enables Turnstile; tokens are single-use, so each attempt mints a fresh
+    one. HTTP is preferred; the browser is started only when Cloudflare
+    blocks it or Turnstile must be minted.
+    """
+
+    def __init__(self, display_name: str, base_url: str, env_prefix: str) -> None:
+        self.name = display_name
+        self.base_url = base_url.rstrip("/")
+        self.env_prefix = env_prefix
+        self.env_keys = ("TOKEN", "COOKIE", "USER_ID")
+
+    def accounts(self) -> list[Account]:
+        accounts = discover_env_accounts(self.name, self.env_prefix, self.env_keys)
+        for account in accounts:
+            if not account.values.get("TOKEN") and not account.values.get("COOKIE"):
+                raise CheckinError(
+                    f"账号配置不完整：{account.label} 需要 "
+                    f"{self.env_prefix}_TOKEN{account.suffix}"
+                    f"（推荐，站点「个人设置 → 系统访问令牌」生成）"
+                    f"或 {self.env_prefix}_COOKIE{account.suffix}，"
+                    f"只配置 {self.env_prefix}_USER_ID{account.suffix} 无法登录"
+                )
+        return accounts
+
+    def run(self, account: Account) -> AccountReport:
+        token = account.values.get("TOKEN", "")
+        cookie = account.values.get("COOKIE", "")
+        user_id = account.values.get("USER_ID", "")
+        suffix = account.suffix
+        token_env = f"{self.env_prefix}_TOKEN{suffix}"
+
+        session = Session(
+            base_cookie=cookie,
+            cookie_env=token_env if token else f"{self.env_prefix}_COOKIE{suffix}",
+            expiry_hint=(
+                f"请到站点「个人设置 → 系统访问令牌」重新生成 {token_env}"
+                if token
+                else ""
+            ),
+        )
+        api: Any = HttpApi(session, self.base_url, token=token, user_id=user_id)
+        try:
+            try:
+                config = self._site_config(api)
+            except WafBlockedError:
+                api = self._ensure_browser(api, session, token, user_id, cookie)
+                config = self._site_config(api)
+
+            if config["checkin_enabled"] is False:
+                return AccountReport(
+                    label=account.label,
+                    title="签到功能未启用",
+                    lines=["站点 checkin_enabled=false，跳过签到"],
+                    checked_in=None,
+                )
+
+            if cookie and not token:
+                api.refresh_token()
+
+            checkin_data = self._get_checkin_data(api)
+            if checkin_data is None:
+                return AccountReport(
+                    label=account.label,
+                    title="签到功能未启用",
+                    lines=["站点未开启签到（接口返回未启用）"],
+                    checked_in=None,
+                )
+            stats = checkin_data.get("stats") or {}
+            if stats.get("checked_in_today"):
+                user = api.request("GET", "/api/user/self")
+                return self._already_report(account, user, stats, config)
+
+            before_user = api.request("GET", "/api/user/self")
+            try:
+                result = self._do_checkin(api, config)
+            except TurnstileRequiredError:
+                api = self._ensure_browser(api, session, token, user_id, cookie)
+                result = self._do_checkin(api, config)
+
+            if result.get("success") is not True:
+                message = str(result.get("message") or "")
+                if "已签到" in message:
+                    return self._already_report(
+                        account, before_user, stats, config, message
+                    )
+                raise CheckinError(f"{self.name} 签到失败：{message}")
+
+            try:
+                final_stats = (self._get_checkin_data(api) or {}).get("stats") or stats
+            except CheckinError:
+                final_stats = stats
+            try:
+                after_user = api.request("GET", "/api/user/self")
+            except CheckinError:
+                after_user = before_user
+            return self._success_report(
+                account, result, before_user, after_user, final_stats, config
+            )
+        finally:
+            api.close()
+
+    def _ensure_browser(
+        self,
+        api: Any,
+        session: Session,
+        token: str,
+        user_id: str,
+        cookie: str,
+    ) -> Any:
+        if api.transport_name == "browser":
+            return api
+        browser = BrowserApi(
+            session,
+            self.base_url,
+            token=getattr(api, "token", "") or token,
+            user_id=user_id,
+            cookie=cookie,
+        )
+        api.close()
+        if cookie and not browser.token:
+            browser.refresh_token()
+        return browser
+
+    def _site_config(self, api: Any) -> dict[str, Any]:
+        result = api.request("GET", "/api/status")
+        if result.get("success") is not True:
+            raise CheckinError(
+                f"读取 {self.name} 站点配置失败：{result.get('message') or 'unknown response'}"
+            )
+        data = result.get("data") or {}
+        enabled = data.get("checkin_enabled")
+        try:
+            per_unit = Decimal(str(data.get("quota_per_unit") or QUOTA_PER_USD))
+        except Exception:
+            per_unit = QUOTA_PER_USD
+        return {
+            "checkin_enabled": None if enabled is None else bool(enabled),
+            "turnstile": bool(data.get("turnstile_check")),
+            "sitekey": str(data.get("turnstile_site_key") or ""),
+            "quota_per_unit": per_unit,
+        }
+
+    def _get_checkin_data(self, api: Any) -> dict[str, Any] | None:
+        result = api.request("GET", "/api/user/checkin")
+        if result.get("success") is not True:
+            message = str(result.get("message") or "")
+            if "未启用" in message:
+                return None
+            raise CheckinError(f"读取签到状态失败：{message}")
+        return result.get("data") or {}
+
+    def _do_checkin(self, api: Any, config: dict[str, Any]) -> dict[str, Any]:
+        if config["turnstile"] and not config["sitekey"]:
+            raise CheckinError(
+                "站点开启了 Turnstile 但 /api/status 未返回 sitekey，无法自动签到"
+            )
+        last_message = ""
+        for _ in range(CHECKIN_ATTEMPTS):
+            path = "/api/user/checkin"
+            if config["turnstile"]:
+                turnstile_token = api.mint_turnstile(config["sitekey"])
+                path += "?turnstile=" + urllib.parse.quote(turnstile_token)
+            result = api.request("POST", path)
+            if result.get("success") is True:
+                return result
+            message = str(result.get("message") or "")
+            last_message = message
+            if "已签到" in message:
+                return result
+            if "turnstile" in message.lower():
+                continue
+            raise CheckinError(f"{self.name} 签到失败：{message}")
+        raise CheckinError(
+            f"{self.name} 签到失败（重试 {CHECKIN_ATTEMPTS} 次后）：{last_message}"
+        )
+
+    def _already_report(
+        self,
+        account: Account,
+        user: dict[str, Any],
+        stats: dict[str, Any],
+        config: dict[str, Any],
+        message: str = "今日已签到",
+    ) -> AccountReport:
+        data = user.get("data") or {}
+        per_unit = config["quota_per_unit"]
+        quota = int(data.get("quota") or 0)
+        lines = [
+            f"签到结果：{message}",
+            f"当前额度：{quota_text(quota, per_unit)}",
+            f"本月已签 {stats.get('checkin_count', 0)} 天；"
+            f"累计签到 {stats.get('total_checkins', 0)} 次，"
+            f"累计获得 {quota_text(int(stats.get('total_quota') or 0), per_unit)}",
+        ]
+        return AccountReport(
+            label=account.label,
+            title=str(data.get("display_name") or data.get("username") or "Unknown"),
+            lines=lines,
+            checked_in=False,
+        )
+
+    def _success_report(
+        self,
+        account: Account,
+        result: dict[str, Any],
+        before_user: dict[str, Any],
+        after_user: dict[str, Any],
+        stats: dict[str, Any],
+        config: dict[str, Any],
+    ) -> AccountReport:
+        per_unit = config["quota_per_unit"]
+        data = result.get("data") or {}
+        awarded = int(data.get("quota_awarded") or 0)
+        before_quota = int((before_user.get("data") or {}).get("quota") or 0)
+        after_quota = int((after_user.get("data") or {}).get("quota") or 0)
+        after_data = after_user.get("data") or {}
+        lines = [
+            f"签到结果：{result.get('message') or '签到成功'}",
+            f"获得额度：{quota_text(awarded, per_unit)}",
+            f"额度变化：{quota_text(before_quota, per_unit)}"
+            f" → {quota_text(after_quota, per_unit)}",
+            f"累计签到 {stats.get('total_checkins', '?')} 次，"
+            f"累计获得 {quota_text(int(stats.get('total_quota') or 0), per_unit)}",
+        ]
+        return AccountReport(
+            label=account.label,
+            title=str(
+                after_data.get("display_name")
+                or after_data.get("username")
+                or "Unknown"
+            ),
+            lines=lines,
+            checked_in=True,
+        )
+
+
+PROVIDERS: tuple[Provider, ...] = (AnyRouterProvider(),) + tuple(
+    NewApiCheckinProvider(name, base_url, prefix)
+    for name, base_url, prefix in NEW_API_SITES
+)
 
 
 def send_pushplus(token: str, title: str, content: str) -> None:
@@ -461,7 +1152,9 @@ def run() -> tuple[bool, str, str]:
 
     if not pending:
         raise CheckinError(
-            "未配置任何账号：请设置 ANYROUTER_USER_ID/ANYROUTER_COOKIE（也支持 ANYROUTER_USER_ID1 这类编号形式）"
+            "未配置任何账号：请设置 ANYROUTER_USER_ID/ANYROUTER_COOKIE，"
+            "或 JUSTWOKER_TOKEN / GOROUTER_TOKEN / TABITOKEN_TOKEN"
+            "（也支持编号后缀，如 JUSTWOKER_TOKEN1）"
         )
 
     sections = [f"执行时间：{now_text()}（北京时间）"]

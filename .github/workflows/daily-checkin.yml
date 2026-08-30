@@ -16,7 +16,7 @@ concurrency:
 jobs:
   check-in:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -26,7 +26,16 @@ jobs:
         with:
           python-version: "3.x"
 
+      - name: Install Playwright browser
+        run: |
+          pip install playwright
+          python -m playwright install --with-deps chromium
+
       - name: Run daily check-in
+        # xvfb 提供虚拟显示，回退的 Chromium 以有头模式运行。
+        # 注意：runner 上没有桌面 Chrome，回退浏览器过 Cloudflare/Turnstile 的成功率有限，
+        # 要求 Turnstile 的站点在 CI 失败时请改用本机计划任务跑（见 README）。
+        run: xvfb-run -a python checkin.py
         env:
           # AnyRouter 单账号（旧配置，继续兼容）
           ANYROUTER_USER_ID: ${{ secrets.ANYROUTER_USER_ID }}
@@ -43,6 +52,46 @@ jobs:
           ANYROUTER_COOKIE4: ${{ secrets.ANYROUTER_COOKIE4 }}
           ANYROUTER_USER_ID5: ${{ secrets.ANYROUTER_USER_ID5 }}
           ANYROUTER_COOKIE5: ${{ secrets.ANYROUTER_COOKIE5 }}
+          # New-API 站点（推荐配置系统访问令牌 *_TOKEN；*_COOKIE 为备用凭证，二选一即可）
+          # 未配置的站点会被自动跳过，不影响其他站点。
+          JUSTWOKER_TOKEN: ${{ secrets.JUSTWOKER_TOKEN }}
+          JUSTWOKER_COOKIE: ${{ secrets.JUSTWOKER_COOKIE }}
+          JUSTWOKER_USER_ID: ${{ secrets.JUSTWOKER_USER_ID }}
+          JUSTWOKER_TOKEN1: ${{ secrets.JUSTWOKER_TOKEN1 }}
+          JUSTWOKER_COOKIE1: ${{ secrets.JUSTWOKER_COOKIE1 }}
+          JUSTWOKER_TOKEN2: ${{ secrets.JUSTWOKER_TOKEN2 }}
+          JUSTWOKER_COOKIE2: ${{ secrets.JUSTWOKER_COOKIE2 }}
+          JUSTWOKER_TOKEN3: ${{ secrets.JUSTWOKER_TOKEN3 }}
+          JUSTWOKER_COOKIE3: ${{ secrets.JUSTWOKER_COOKIE3 }}
+          JUSTWOKER_TOKEN4: ${{ secrets.JUSTWOKER_TOKEN4 }}
+          JUSTWOKER_COOKIE4: ${{ secrets.JUSTWOKER_COOKIE4 }}
+          JUSTWOKER_TOKEN5: ${{ secrets.JUSTWOKER_TOKEN5 }}
+          JUSTWOKER_COOKIE5: ${{ secrets.JUSTWOKER_COOKIE5 }}
+          GOROUTER_TOKEN: ${{ secrets.GOROUTER_TOKEN }}
+          GOROUTER_COOKIE: ${{ secrets.GOROUTER_COOKIE }}
+          GOROUTER_USER_ID: ${{ secrets.GOROUTER_USER_ID }}
+          GOROUTER_TOKEN1: ${{ secrets.GOROUTER_TOKEN1 }}
+          GOROUTER_COOKIE1: ${{ secrets.GOROUTER_COOKIE1 }}
+          GOROUTER_TOKEN2: ${{ secrets.GOROUTER_TOKEN2 }}
+          GOROUTER_COOKIE2: ${{ secrets.GOROUTER_COOKIE2 }}
+          GOROUTER_TOKEN3: ${{ secrets.GOROUTER_TOKEN3 }}
+          GOROUTER_COOKIE3: ${{ secrets.GOROUTER_COOKIE3 }}
+          GOROUTER_TOKEN4: ${{ secrets.GOROUTER_TOKEN4 }}
+          GOROUTER_COOKIE4: ${{ secrets.GOROUTER_COOKIE4 }}
+          GOROUTER_TOKEN5: ${{ secrets.GOROUTER_TOKEN5 }}
+          GOROUTER_COOKIE5: ${{ secrets.GOROUTER_COOKIE5 }}
+          TABITOKEN_TOKEN: ${{ secrets.TABITOKEN_TOKEN }}
+          TABITOKEN_COOKIE: ${{ secrets.TABITOKEN_COOKIE }}
+          TABITOKEN_USER_ID: ${{ secrets.TABITOKEN_USER_ID }}
+          TABITOKEN_TOKEN1: ${{ secrets.TABITOKEN_TOKEN1 }}
+          TABITOKEN_COOKIE1: ${{ secrets.TABITOKEN_COOKIE1 }}
+          TABITOKEN_TOKEN2: ${{ secrets.TABITOKEN_TOKEN2 }}
+          TABITOKEN_COOKIE2: ${{ secrets.TABITOKEN_COOKIE2 }}
+          TABITOKEN_TOKEN3: ${{ secrets.TABITOKEN_TOKEN3 }}
+          TABITOKEN_COOKIE3: ${{ secrets.TABITOKEN_COOKIE3 }}
+          TABITOKEN_TOKEN4: ${{ secrets.TABITOKEN_TOKEN4 }}
+          TABITOKEN_COOKIE4: ${{ secrets.TABITOKEN_COOKIE4 }}
+          TABITOKEN_TOKEN5: ${{ secrets.TABITOKEN_TOKEN5 }}
+          TABITOKEN_COOKIE5: ${{ secrets.TABITOKEN_COOKIE5 }}
           # PushPlus 推送通知
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
-        run: python checkin.py
