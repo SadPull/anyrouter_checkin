@@ -1,4 +1,4 @@
-import io
+﻿import io
 import unittest
 import urllib.error
 from email.message import Message
@@ -226,6 +226,123 @@ class SessionTests(unittest.TestCase):
                     attempts=1,
                 ),
             )
+
+
+class JustWokerProviderTests(unittest.TestCase):
+    def setUp(self):
+        self.provider = checkin.JustWokerProvider()
+
+    def account(self):
+        return checkin.Account(
+            label="JustWoker 账号",
+            suffix="",
+            values={"USER_ID": "12345", "TOKEN": "tok"},
+        )
+
+    def test_headers_carry_bearer_token_and_user_id(self):
+        headers = self.provider.headers("12345", "tok")
+        self.assertEqual(headers["Authorization"], "Bearer tok")
+        self.assertEqual(headers["New-Api-User"], "12345")
+        self.assertIn("json", headers["Accept"])
+
+    def test_run_reports_bonus_and_quota_delta(self):
+        state = {"quota": 1_000_000}
+
+        def fake(self_, url, **kwargs):
+            if url.endswith("/api/status"):
+                return {"success": True, "data": {"quota_per_unit": 500000}}
+            if url.endswith("/api/user/self"):
+                return {
+                    "success": True,
+                    "data": {"quota": state["quota"], "username": "SadPull"},
+                }
+            if url.endswith("/api/user/checkin"):
+                if kwargs.get("method") != "POST":
+                    raise AssertionError("check-in must be a POST")
+                state["quota"] += 500_000
+                return {"success": True, "message": "签到成功"}
+            raise AssertionError(f"unexpected url: {url}")
+
+        with patch("checkin.Session.request_json", fake):
+            report = self.provider.run(self.account())
+
+        self.assertTrue(report.checked_in)
+        self.assertEqual(report.title, "SadPull")
+        self.assertIn("额度变化：500000 ($1.00)", report.lines)
+        self.assertIn("当前额度：1500000 ($3.00)", report.lines)
+
+    def test_run_treats_already_checked_in_as_not_claimed(self):
+        def fake(self_, url, **kwargs):
+            if url.endswith("/api/status"):
+                return {"success": True, "data": {"quota_per_unit": 500000}}
+            if url.endswith("/api/user/self"):
+                return {"success": True, "data": {"quota": 100, "username": "u"}}
+            if url.endswith("/api/user/checkin"):
+                # Duplicate check-in: 200 + success=false + message.
+                return {"success": False, "message": "今日已签到"}
+            raise AssertionError(f"unexpected url: {url}")
+
+        with patch("checkin.Session.request_json", fake):
+            report = self.provider.run(self.account())
+
+        self.assertFalse(report.checked_in)
+        self.assertIn("今日已签到", report.text())
+
+    def test_checkin_falls_back_to_legacy_path_on_404(self):
+        calls = []
+
+        def fake(self_, url, **kwargs):
+            calls.append(url)
+            if url.endswith("/api/user/checkin"):
+                raise checkin.CheckinError(f"POST {url} failed with HTTP 404")
+            if url.endswith("/api/user/sign_in"):
+                return {"success": True, "message": "签到成功"}
+            raise AssertionError(f"unexpected url: {url}")
+
+        session = checkin.Session()
+        with patch("checkin.Session.request_json", fake):
+            message, claimed = self.provider.check_in(session, "12345", "tok")
+
+        self.assertTrue(claimed)
+        self.assertEqual(message, "签到成功")
+        self.assertEqual(
+            calls,
+            [
+                "https://api.justwoker.icu/api/user/checkin",
+                "https://api.justwoker.icu/api/user/sign_in",
+            ],
+        )
+
+    def test_quota_per_unit_falls_back_to_default_when_status_fails(self):
+        def fake(self_, url, **kwargs):
+            raise checkin.CheckinError("GET https://api.justwoker.icu/api/status failed")
+
+        session = checkin.Session()
+        with patch("checkin.Session.request_json", fake):
+            per_unit = self.provider.quota_per_unit(session)
+
+        self.assertEqual(per_unit, checkin.QUOTA_PER_USD)
+
+    def test_accounts_requires_all_keys(self):
+        with patch.dict(
+            checkin.os.environ, {"JUSTWOKER_USER_ID": "12345"}, clear=True
+        ):
+            with self.assertRaises(checkin.CheckinError) as raised:
+                self.provider.accounts()
+
+        self.assertIn("JUSTWOKER_TOKEN", str(raised.exception))
+
+    def test_numbered_env_accounts_are_discovered(self):
+        env = {
+            "JUSTWOKER_USER_ID": "1",
+            "JUSTWOKER_TOKEN": "a",
+            "JUSTWOKER_USER_ID2": "2",
+            "JUSTWOKER_TOKEN2": "b",
+        }
+        with patch.dict(checkin.os.environ, env, clear=True):
+            accounts = self.provider.accounts()
+
+        self.assertEqual([account.suffix for account in accounts], ["", "2"])
 
 
 if __name__ == "__main__":
