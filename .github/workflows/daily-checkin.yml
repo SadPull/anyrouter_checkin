@@ -43,21 +43,6 @@ jobs:
           ANYROUTER_COOKIE4: ${{ secrets.ANYROUTER_COOKIE4 }}
           ANYROUTER_USER_ID5: ${{ secrets.ANYROUTER_USER_ID5 }}
           ANYROUTER_COOKIE5: ${{ secrets.ANYROUTER_COOKIE5 }}
-          # JustWoker 单账号（https://api.justwoker.icu，系统访问令牌认证）
-          JUSTWOKER_USER_ID: ${{ secrets.JUSTWOKER_USER_ID }}
-          JUSTWOKER_TOKEN: ${{ secrets.JUSTWOKER_TOKEN }}
-          # JustWoker 多账号：按需在仓库 Secrets 中添加对应编号；未配置的编号会被自动跳过。
-          # 如需超过 5 个账号，按同样格式继续追加。
-          JUSTWOKER_USER_ID1: ${{ secrets.JUSTWOKER_USER_ID1 }}
-          JUSTWOKER_TOKEN1: ${{ secrets.JUSTWOKER_TOKEN1 }}
-          JUSTWOKER_USER_ID2: ${{ secrets.JUSTWOKER_USER_ID2 }}
-          JUSTWOKER_TOKEN2: ${{ secrets.JUSTWOKER_TOKEN2 }}
-          JUSTWOKER_USER_ID3: ${{ secrets.JUSTWOKER_USER_ID3 }}
-          JUSTWOKER_TOKEN3: ${{ secrets.JUSTWOKER_TOKEN3 }}
-          JUSTWOKER_USER_ID4: ${{ secrets.JUSTWOKER_USER_ID4 }}
-          JUSTWOKER_TOKEN4: ${{ secrets.JUSTWOKER_TOKEN4 }}
-          JUSTWOKER_USER_ID5: ${{ secrets.JUSTWOKER_USER_ID5 }}
-          JUSTWOKER_TOKEN5: ${{ secrets.JUSTWOKER_TOKEN5 }}
           # PushPlus 推送通知
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
         run: python checkin.py

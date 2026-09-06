@@ -23,7 +23,6 @@ from zoneinfo import ZoneInfo
 
 
 ANYROUTER_BASE_URL = "https://anyrouter.top"
-JUSTWOKER_BASE_URL = "https://api.justwoker.icu"
 PUSHPLUS_URL = "https://www.pushplus.plus/send"
 # The site reports quota_per_unit = 500000 in /api/status.
 QUOTA_PER_USD = Decimal("500000")
@@ -442,134 +441,7 @@ class AnyRouterProvider(Provider):
         )
 
 
-class JustWokerProvider(Provider):
-    """api.justwoker.icu: the JWT-era New-API, driven by a system access token.
-
-    The site sits behind Cloudflare (not the Aliyun WAF) and replaced the old
-    session cookie with short-lived Bearer access tokens. A browser-copied
-    ``new_api_refresh`` cookie cannot be reused daily: the server rotates it on
-    every refresh and revokes the whole login session once a retired token
-    shows up again. The user-level System Access Token (Personal Settings ->
-    Security) stays valid until regenerated, so it takes the cookie's place.
-    """
-
-    name = "JustWoker"
-    env_prefix = "JUSTWOKER"
-    env_keys = ("USER_ID", "TOKEN")
-    # Newer New-API moved the check-in route to /api/user/checkin; older
-    # deployments only expose /api/user/sign_in. A 404 on the first path
-    # triggers an automatic retry against the legacy one.
-    checkin_paths = ("/api/user/checkin", "/api/user/sign_in")
-
-    def accounts(self) -> list[Account]:
-        accounts = super().accounts()
-        for account in accounts:
-            for key in self.env_keys:
-                if not account.values.get(key):
-                    raise CheckinError(
-                        f"账号配置不完整：缺少 {self.env_prefix}_{key}{account.suffix}"
-                    )
-        return accounts
-
-    def headers(self, user_id: str, token: str) -> dict[str, str]:
-        return {
-            "Authorization": f"Bearer {token}",
-            "New-Api-User": user_id,
-            "Accept": "application/json",
-            "Cache-Control": "no-store",
-            "User-Agent": USER_AGENT,
-        }
-
-    def quota_per_unit(self, session: Session) -> Decimal:
-        """Read quota_per_unit from the public /api/status endpoint.
-
-        Falls back to the New-API default (500000) when the endpoint is
-        unavailable or the field is missing: a wrong divisor only skews the
-        dollar display, never the check-in itself.
-        """
-        try:
-            result = session.request_json(
-                f"{JUSTWOKER_BASE_URL}/api/status",
-                headers={
-                    "Accept": "application/json",
-                    "Cache-Control": "no-store",
-                    "User-Agent": USER_AGENT,
-                },
-                attempts=2,
-            )
-            data = result.get("data")
-            if isinstance(data, dict) and data.get("quota_per_unit"):
-                per_unit = Decimal(str(data["quota_per_unit"]))
-                if per_unit > 0:
-                    return per_unit
-        except (CheckinError, ArithmeticError, ValueError, TypeError):
-            pass
-        return QUOTA_PER_USD
-
-    def get_user(self, session: Session, user_id: str, token: str) -> dict[str, Any]:
-        result = session.request_json(
-            f"{JUSTWOKER_BASE_URL}/api/user/self",
-            headers=self.headers(user_id, token),
-        )
-        if result.get("success") is not True or not isinstance(result.get("data"), dict):
-            message = str(result.get("message") or "unknown server response")
-            raise CheckinError(f"读取 JustWoker 用户信息失败：{message}")
-        return result["data"]
-
-    def check_in(self, session: Session, user_id: str, token: str) -> tuple[str, bool]:
-        """POST the check-in endpoint; returns (message, bonus_claimed)."""
-        headers = self.headers(user_id, token)
-        last_error: CheckinError | None = None
-        for path in self.checkin_paths:
-            try:
-                result = session.request_json(
-                    f"{JUSTWOKER_BASE_URL}{path}",
-                    method="POST",
-                    headers=headers,
-                )
-            except CheckinError as exc:
-                if "HTTP 404" in str(exc):
-                    last_error = exc
-                    continue
-                raise
-            message = str(result.get("message") or "签到接口返回成功")
-            if "已签到" in message:
-                # Signed in earlier today: authenticated, but no fresh bonus.
-                return message, False
-            if result.get("success") is not True:
-                raise CheckinError(f"JustWoker 签到失败：{message}")
-            return message, True
-        raise last_error or CheckinError("JustWoker 签到失败：签到接口不存在")
-
-    def run(self, account: Account) -> AccountReport:
-        user_id = account.values["USER_ID"]
-        token = account.values["TOKEN"]
-        # Header-only auth; the env var name is still reported on expiry.
-        session = Session(cookie_env=f"{self.env_prefix}_TOKEN{account.suffix}")
-
-        per_unit = self.quota_per_unit(session)
-        before = self.get_user(session, user_id, token)
-        message, claimed = self.check_in(session, user_id, token)
-        after = self.get_user(session, user_id, token)
-
-        before_quota = int(before.get("quota", 0))
-        after_quota = int(after.get("quota", 0))
-        username = str(after.get("display_name") or after.get("username") or "Unknown")
-
-        return AccountReport(
-            label=account.label,
-            title=username,
-            lines=[
-                f"签到结果：{message}",
-                f"签到前额度：{quota_text(before_quota, per_unit)}",
-                f"当前额度：{quota_text(after_quota, per_unit)}",
-                f"额度变化：{quota_text(after_quota - before_quota, per_unit)}",
-            ],
-            checked_in=claimed,
-        )
-
-
-PROVIDERS: tuple[Provider, ...] = (AnyRouterProvider(), JustWokerProvider())
+PROVIDERS: tuple[Provider, ...] = (AnyRouterProvider(),)
 
 
 def send_pushplus(token: str, title: str, content: str) -> None:
@@ -601,7 +473,7 @@ def run() -> tuple[bool, str, str]:
 
     if not pending:
         raise CheckinError(
-            "未配置任何账号：请设置 JUSTWOKER_USER_ID/JUSTWOKER_TOKEN 或 ANYROUTER_USER_ID/ANYROUTER_COOKIE（也支持 ANYROUTER_USER_ID1、JUSTWOKER_TOKEN1 这类编号形式）"
+            "未配置任何账号：请设置 ANYROUTER_USER_ID/ANYROUTER_COOKIE（也支持 ANYROUTER_USER_ID1 这类编号形式）"
         )
 
     sections = [f"执行时间：{now_text()}（北京时间）"]
