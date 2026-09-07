@@ -1,4 +1,5 @@
 import io
+import json
 import unittest
 import urllib.error
 from email.message import Message
@@ -226,6 +227,83 @@ class SessionTests(unittest.TestCase):
                     attempts=1,
                 ),
             )
+
+
+class PushPlusTests(unittest.TestCase):
+    def setUp(self):
+        self.opener = FakeOpener([])
+        self.stderr = io.StringIO()
+        for patcher in (
+            patch.dict(checkin.os.environ, {"PUSHPLUS_TOKEN": "test-token"}, clear=True),
+            patch("checkin.urllib.request.build_opener", return_value=self.opener),
+            patch("checkin.now_text", return_value="2026-09-07 09:00:00"),
+            patch("checkin.sys.stdout", new=io.StringIO()),
+            patch("checkin.sys.stderr", new=self.stderr),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def group_payloads(self):
+        payloads = []
+        for request in self.opener.requests:
+            self.assertEqual(request.full_url, "https://www.pushplus.plus/send")
+            self.assertEqual(request.get_method(), "POST")
+            payload = json.loads(request.data)
+            self.assertEqual(payload["token"], "test-token")
+            self.assertEqual(payload["topic"], "PullxD")
+            self.assertEqual(payload["template"], "txt")
+            payloads.append(payload)
+        return payloads
+
+    def test_summary_is_sent_to_fixed_group(self):
+        for all_ok, title in (
+            (True, "每日签到成功"),
+            (False, "每日签到：1 成功 / 1 失败"),
+        ):
+            with self.subTest(all_ok=all_ok):
+                self.opener.requests.clear()
+                self.opener.outcomes = [FakeResponse('{"code": 200}')]
+                content = "【AnyRouter 账号】签到结果\n当前额度：500000 ($1.00)"
+                with patch("checkin.run", return_value=(all_ok, title, content)):
+                    exit_code = checkin.main()
+
+                self.assertEqual(exit_code, 0 if all_ok else 1)
+                payloads = self.group_payloads()
+                self.assertEqual(len(payloads), 1)
+                self.assertEqual(payloads[0]["title"], title)
+                self.assertEqual(payloads[0]["content"], content)
+
+    def test_exception_notification_is_sent_to_fixed_group(self):
+        self.opener.outcomes = [FakeResponse('{"code": 200}')]
+        with patch("checkin.run", side_effect=checkin.CheckinError("账号配置不完整")):
+            exit_code = checkin.main()
+
+        self.assertEqual(exit_code, 1)
+        payloads = self.group_payloads()
+        self.assertEqual(len(payloads), 1)
+        self.assertEqual(payloads[0]["title"], "每日签到失败")
+        self.assertIn("失败原因：账号配置不完整", payloads[0]["content"])
+
+    def test_pushplus_rejection_raises_checkin_error(self):
+        self.opener.outcomes = [FakeResponse('{"code": 400, "msg": "群组不存在"}')]
+        with self.assertRaisesRegex(checkin.CheckinError, "PushPlus 推送失败：群组不存在"):
+            checkin.send_pushplus("test-token", "测试标题", "测试内容")
+
+        self.assertEqual(len(self.group_payloads()), 1)
+
+    def test_main_fails_when_pushplus_rejects_notifications(self):
+        self.opener.outcomes = [
+            FakeResponse('{"code": 400, "msg": "群组不存在"}') for _ in range(2)
+        ]
+        with patch("checkin.run", return_value=(True, "每日签到成功", "签到结果")):
+            exit_code = checkin.main()
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("PushPlus 推送失败：群组不存在", self.stderr.getvalue())
+        payloads = self.group_payloads()
+        self.assertEqual(len(payloads), 2)
+        self.assertEqual(payloads[0]["title"], "每日签到成功")
+        self.assertEqual(payloads[1]["title"], "每日签到失败")
 
 
 class AccountDiscoveryTests(unittest.TestCase):

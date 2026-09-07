@@ -1,6 +1,6 @@
 # AnyRouter 多账号自动签到
 
-每天北京时间 09:00 通过 GitHub Actions 给 AnyRouter（https://anyrouter.top）签到，并用 PushPlus 把所有账号的结果、当前额度合并成一条通知推送。也可以在 Actions 页面手动运行。
+每天北京时间 09:00 通过 GitHub Actions 给 AnyRouter（https://anyrouter.top）签到，并用 PushPlus 把所有账号的结果、当前额度合并成一条通知，推送给 `PullxD` 群组的所有成员。也可以在 Actions 页面手动运行。
 
 ## 签到机制
 
@@ -14,9 +14,19 @@ AnyRouter 是 New-API 二次开发站点，有真正的签到接口 `POST /api/u
 
 - `ANYROUTER_USER_ID`：浏览器登录 AnyRouter 后，请求头 `New-API-User` 的值。
 - `ANYROUTER_COOKIE`：浏览器已登录 AnyRouter 时，请求头中完整的 `Cookie` 值。
-- `PUSHPLUS_TOKEN`：PushPlus 网站获取的用户 token（所有账号共用一个）。
+- `PUSHPLUS_TOKEN`：有权向 `PullxD` 群组推送的 PushPlus 用户 token（所有账号共用一个）。
 
 `ANYROUTER_USER_ID` 和 `ANYROUTER_COOKIE` 必须成对配置。
+
+### PushPlus 一对多推送
+
+签到结果汇总和失败提醒统一发送到群组编码为 `PullxD` 的群组。脚本在推送请求中固定携带 `topic: "PullxD"`，继续使用现有的 `PUSHPLUS_TOKEN`，GitHub Actions 无需新增变量。
+
+1. 登录 PushPlus 官网，进入“发送消息” → “一对多消息”，在“创建的群组”中确认已有编码为 `PullxD` 的群组；没有则点击“新建群组”，将群组编码填写为 `PullxD`（大小写一致）。
+2. 确认仓库 Secret `PUSHPLUS_TOKEN` 使用该群组创建者的用户 token，具备向该群组推送的权限。
+3. 在群组中点击“查看二维码”，将二维码分享给接收人。接收人通过微信或 PushPlus App 扫码加入群组后，即可接收群发消息。
+
+上线后可通过定时任务在 PushPlus 后台和接收端核验送达情况。接口返回 `code=200` 仅表示请求已受理，最终送达情况以 PushPlus 的消息记录和接收端为准。配置细节见 [PushPlus 一对多消息官方说明](https://www.pushplus.plus/doc/function/more.html)。
 
 ### 多账号
 

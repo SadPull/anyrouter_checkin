@@ -24,6 +24,7 @@ from zoneinfo import ZoneInfo
 
 ANYROUTER_BASE_URL = "https://anyrouter.top"
 PUSHPLUS_URL = "https://www.pushplus.plus/send"
+PUSHPLUS_TOPIC = "PullxD"
 # The site reports quota_per_unit = 500000 in /api/status.
 QUOTA_PER_USD = Decimal("500000")
 TIMEOUT_SECONDS = 15
@@ -452,6 +453,7 @@ def send_pushplus(token: str, title: str, content: str) -> None:
             "token": token,
             "title": title,
             "content": content,
+            "topic": PUSHPLUS_TOPIC,
             "template": "txt",
         },
     )
